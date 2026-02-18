@@ -13,7 +13,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 BAM="/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam"
-REFERENCE="/data/salomonis-archive/genomes/hg38/genome.fa"
+REFERENCE="$PROJECT_DIR/reference/genome.fa"
 TRUTH_BED="$PROJECT_DIR/truth_set/truth_regions.bed"
 TRUTH_VARIANTS="$PROJECT_DIR/truth_set/test_variants_formatted.txt"
 
@@ -107,39 +107,49 @@ run_lab_unsupervised() {
 run_gatk() {
     echo ""
     echo "========================================================================"
-    echo "[CALLER] GATK HaplotypeCaller (RNA-seq mode)"
+    echo "[CALLER] GATK HaplotypeCaller (RNA-seq mode via Singularity)"
     echo "========================================================================"
 
     OUTPUT_DIR="$PROJECT_DIR/results/haplotypecaller"
     LOG_FILE="$LOG_DIR/gatk.log"
+    CONTAINER="$PROJECT_DIR/containers/gatk.sif"
+    SINGULARITY="/users/pavb5f/.conda/envs/bio-cli/bin/singularity"
 
     mkdir -p "$OUTPUT_DIR"
 
-    echo "[INFO] Running GATK HaplotypeCaller..."
-    echo "[INFO] Output: $OUTPUT_DIR"
-    echo "[INFO] Log: $LOG_FILE"
-
-    # Try to use GATK from isolated environment
-    GATK_ENV="/users/pavb5f/.conda/envs/gatk-env-v2/bin/gatk"
-
-    if [ ! -x "$GATK_ENV" ]; then
-        echo "[ERROR] GATK not found at $GATK_ENV"
-        echo "[ERROR] Please create gatk-env-v2 conda environment first"
+    if [ ! -f "$CONTAINER" ]; then
+        echo "[ERROR] GATK container not found at $CONTAINER"
+        echo "[ERROR] Pull with: singularity pull containers/gatk.sif docker://broadinstitute/gatk:latest"
         return 1
     fi
 
+    echo "[INFO] Running GATK HaplotypeCaller..."
+    echo "[INFO] Container: $CONTAINER"
+    echo "[INFO] Output: $OUTPUT_DIR"
+    echo "[INFO] Log: $LOG_FILE"
+
     # Call variants
     echo "[STEP] HaplotypeCaller..." | tee "$LOG_FILE"
-    $GATK_ENV HaplotypeCaller \
-        -R "$REFERENCE" \
-        -I "$BAM" \
-        -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
-        --dont-use-soft-clipped-bases \
-        --min-base-quality-score 10 \
-        -L "$TRUTH_BED" \
-        --native-pair-hmm-threads 8 \
-        --sample-name 5801-diagnosis \
-        2>&1 | tee -a "$LOG_FILE"
+    $SINGULARITY exec \
+        --bind /data:/data \
+        --bind "$PROJECT_DIR:$PROJECT_DIR" \
+        "$CONTAINER" \
+        gatk HaplotypeCaller \
+            -R "$REFERENCE" \
+            -I "$BAM" \
+            -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
+            --dont-use-soft-clipped-bases \
+            --min-base-quality-score 10 \
+            -L "$TRUTH_BED" \
+            --native-pair-hmm-threads 8 \
+            --sample-name 5801-diagnosis \
+            2>&1 | tee -a "$LOG_FILE"
+
+    # Check if output exists
+    if [ ! -f "$OUTPUT_DIR/variants_raw.vcf.gz" ]; then
+        echo "[ERROR] GATK did not produce output VCF"
+        return 1
+    fi
 
     # Normalize and index with bcftools
     echo "[STEP] Normalizing VCF..." | tee -a "$LOG_FILE"
