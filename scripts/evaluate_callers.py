@@ -203,15 +203,16 @@ def calculate_vaf_accuracy(truth_variants, caller_variants, truth_to_caller):
 
 def main():
     # Define caller VCF files
-    truth_vcf = '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/truth_set/truth_set.vcf'
+    WORKDIR = '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall'
+    truth_vcf = f'{WORKDIR}/truth_set/truth_set.vcf'
     caller_vcfs = {
-        'Lab_Supervised': '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/results/supervised_extraction/lab_supervised.vcf.gz',
-        'Lab_Unsupervised': '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/results/global_snv/lab_unsupervised.vcf.gz',
-        'GATK': '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/results/gatk/variants_normalized.vcf.gz',
-        'DeepVariant': '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/results/deepvariant/variants_normalized.vcf.gz'
+        'HaplotypeCaller': f'{WORKDIR}/results/haplotypecaller/variants.vcf.gz',
+        'DeepVariant':     f'{WORKDIR}/results/deepvariant/variants.vcf.gz',
+        'Clair3_RNA':      f'{WORKDIR}/results/clair3_rna/merge_output.vcf.gz',
+        'LongcallR':       f'{WORKDIR}/results/longcallr/variants.vcf.gz',
     }
 
-    output_dir = '/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/results/comparison'
+    output_dir = f'{WORKDIR}/results/comparison'
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading truth set from {truth_vcf}...", file=sys.stderr)

@@ -1,36 +1,30 @@
 # Variant Caller Comparison - Implementation Status
 
 ## Summary
-Implementation of comprehensive variant caller comparison pipeline for RNA-seq data from patient 5801-diagnosis.
+Implementation of a four-caller variant calling comparison pipeline for PacBio Iso-Seq RNA-seq data from patient 5801-diagnosis.
 
-**Goal**: Identify best variant caller (GATK, DeepVariant, or Lab Scripts) for production use.
+**Goal**: Identify best variant caller (HaplotypeCaller, DeepVariant, Clair3-RNA, LongcallR) for production use on long-read RNA-seq data.
 
 ---
 
 ## Completed Phases
 
 ### Phase 1: Environment Setup ✓
-- **Tools Available**:
-  - ✓ samtools (installed in bio-cli)
-  - ✓ gatk (installed in bio-cli)
-  - ⏳ bcftools (installing via conda)
-  - ✓ Reference genome (3GB, `/data/salomonis-archive/genomes/hg38/genome.fa`)
-  - ✓ Test BAM (11GB, indexed, at `/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam`)
+- ✓ samtools 1.23 (bio-cli)
+- ✓ bcftools 1.23 (bio-cli)
+- ✓ singularity (bio-cli: `/users/pavb5f/.conda/envs/bio-cli/bin/singularity`)
+- ✓ Reference genome symlink: `$WORKDIR/reference/genome.fa` → spaceranger GRCh38 (chr-prefixed)
+- ✓ Test BAM (11GB, indexed): `/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam`
+- ✓ DeepVariant container (2.7 GB): `$WORKDIR/containers/deepvariant_1.6.1.sif`
 
 ### Phase 2: Truth Set Preparation ✓
-- **Created Scripts**:
-  - `scripts/prepare_truth_vcf.py` - Converts test_variants.txt to VCF format
-  - `scripts/compress_vcf.py` - Compresses VCF files
-  - `truth_set/test_variants_formatted.txt` - Formatted variants for lab scripts
-
-- **Created Files**:
-  - `truth_set/truth_set.vcf` - Uncompressed truth VCF (8 variants)
-  - `truth_set/truth_set.vcf.gz` - Compressed truth VCF
-  - `truth_set/truth_regions.bed` - Target regions for callers (±1kb around variants)
+- ✓ `truth_set/truth_set.vcf.gz` — 8 somatic variants, compressed + indexed
+- ✓ `truth_set/truth_regions.bed` — target regions ±1kb around variants (chr-prefixed)
+- ✓ `truth_set/test_variants_formatted.txt` — formatted for lab scripts
 
 **Truth Set Details** (8 known variants):
 | Gene | Position | Protein Change | VAF | Type |
-|------|----------|-----------------|-----|------|
+|------|----------|----------------|-----|------|
 | RUNX1 | chr21:34799432 | p.W279* | 35% | Nonsense |
 | ASXL1 | chr20:32434638 | p.G643fs | 8% | Frameshift |
 | SETBP1 | chr18:44951948 | p.G870S | 28% | Missense |
@@ -42,203 +36,143 @@ Implementation of comprehensive variant caller comparison pipeline for RNA-seq d
 
 ---
 
+## Current State (as of 2026-02-18)
+
+### Tool Status
+| Tool | Status | Notes |
+|------|--------|-------|
+| samtools 1.23 | ✅ working | bio-cli |
+| bcftools 1.23 | ✅ working | bio-cli |
+| GATK 4.6.2.0 | ❌ broken in bio-cli | `java: undefined symbol: JLI_StringDup` — Java/glibc mismatch |
+| DeepVariant SIF | ✅ present | Container at `$WORKDIR/containers/deepvariant_1.6.1.sif` |
+| Clair3 | ❌ not installed | Needs `clair3-rna` conda env |
+| LongcallR | ❌ not installed | Needs `longcallr` conda env |
+| singularity | ✅ working | `/users/pavb5f/.conda/envs/bio-cli/bin/singularity` |
+
+---
+
 ## In-Progress Phases
 
-### Phase 3: Run Variant Callers (⏳ Next)
+### Phase 3: Install Tools & Run Callers
 
-#### 3.1 Lab Script 1: variant_extraction.py (Supervised)
-
-**Location**: `/data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/variant_extraction.py`
-
-**Command**:
+#### Step 1: Fix GATK — Create `gatk-env`
 ```bash
-python /data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/variant_extraction.py \
-  --sample 5801-diagnosis \
-  --bam /data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-  --mutations truth_set/test_variants_formatted.txt \
-  --reference /data/salomonis-archive/genomes/hg38/genome.fa \
-  --output-dir results/supervised_extraction
+conda create -n gatk-env -c conda-forge -c bioconda openjdk=17 gatk4=4.6.2.0 -y
+/users/pavb5f/.conda/envs/gatk-env/bin/gatk --version
 ```
 
-**Expected Output**:
-- `results/supervised_extraction/5801-diagnosis_complete_analysis.tsv` (read-level details)
-- `results/supervised_extraction/5801-diagnosis_mutation_matrix.csv` (cell × variant matrix)
-
-**Runtime**: 1-2 hours
-
-#### 3.2 Lab Script 2: global_snv.py (Unsupervised Discovery)
-
-**Location**: `/data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/global_snv.py`
-
-**Test run (Chr21 only)**:
+Run HaplotypeCaller:
 ```bash
-python /data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/global_snv.py \
-  /data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-  /data/salomonis-archive/genomes/hg38/genome.fa \
-  results/global_snv/chr21_output.txt \
-  --test_chromosome chr21 \
-  --min_reads 10 \
-  --min_percent 5.0
+bash scripts/run_callers.sh haplotypecaller
 ```
+Output: `results/haplotypecaller/variants.vcf.gz`
 
-**Runtime**: 10-30 min (chr21), 4-8 hours (full genome)
-
-#### 3.3 GATK HaplotypeCaller (RNA-seq mode)
-
-**Command**:
+#### Step 2: DeepVariant (container already present)
 ```bash
-gatk HaplotypeCaller \
-  -R /data/salomonis-archive/genomes/hg38/genome.fa \
-  -I /data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-  -O results/gatk/variants_raw.vcf.gz \
-  --dont-use-soft-clipped-bases \
-  --standard-min-confidence-threshold-for-calling 20.0 \
-  --min-base-quality-score 10 \
-  -L truth_set/truth_regions.bed \
-  --native-pair-hmm-threads 8
+bash scripts/run_callers.sh deepvariant
 ```
+- Uses `--model_type=PACBIO` (correct for PacBio HiFi reads)
+- Output: `results/deepvariant/variants.vcf.gz`
 
-**Filtering**:
+#### Step 3: Install Clair3-RNA
 ```bash
-gatk VariantFiltration \
-  -R /data/salomonis-archive/genomes/hg38/genome.fa \
-  -V results/gatk/variants_raw.vcf.gz \
-  -O results/gatk/variants_filtered.vcf.gz \
-  --filter-name "LowQual" --filter-expression "QUAL < 30.0" \
-  --filter-name "LowDepth" --filter-expression "DP < 10"
+bash scripts/setup_envs.sh clair3
 ```
-
-**Runtime**: 30-60 min
-
-#### 3.4 DeepVariant (via Singularity)
-
-**Setup** (if needed):
+Then update `CLAIR3_MODEL` in `run_callers.sh` to the downloaded model path, then:
 ```bash
-cd containers/
-singularity pull docker://google/deepvariant:1.6.1
+bash scripts/run_callers.sh clair3_rna
 ```
+Output: `results/clair3_rna/merge_output.vcf.gz`
 
-**Command**:
+#### Step 4: Install LongcallR
 ```bash
-singularity exec \
-  --bind /data:/data \
-  containers/deepvariant_1.6.1.sif \
-  /opt/deepvariant/bin/run_deepvariant \
-    --model_type=WGS \
-    --ref=/data/salomonis-archive/genomes/hg38/genome.fa \
-    --reads=/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-    --regions=/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/truth_set/truth_regions.bed \
-    --output_vcf=results/deepvariant/variants.vcf.gz \
-    --output_gvcf=results/deepvariant/variants.g.vcf.gz \
-    --num_shards=8 \
-    --make_examples_extra_args="min_mapping_quality=1"
+bash scripts/setup_envs.sh longcallr
+bash scripts/run_callers.sh longcallr
 ```
+Output: `results/longcallr/variants.vcf.gz`
 
-**Runtime**: 1-2 hours
+#### Or run all at once (after all envs are ready):
+```bash
+bash scripts/setup_envs.sh all
+bash scripts/run_callers.sh all
+```
 
 ---
 
 ## Planned Phases
 
-### Phase 4: Convert Outputs to VCF (1 hour)
-- **Script**: `scripts/tsv_to_vcf.py`
-- Convert lab script TSV outputs to standard VCF format
-- Normalize indels and coordinate representations
+### Phase 4: Evaluate All 4 Callers
+```bash
+python scripts/evaluate_callers.py
+```
+Calculates: sensitivity, precision, F1, VAF correlation, MAE.
+Output: `results/comparison/summary.json`, `results/comparison/comparison.csv`
 
-### Phase 5: Evaluation & Comparison (2-4 hours)
-- **Script**: `scripts/evaluate_callers.py`
-- Calculate: Sensitivity, Precision, F1, VAF accuracy
-- Generate comparison matrices and metrics
-
-### Phase 6: Generate Report (1 hour)
-- Create markdown comparison report
-- Production recommendations
-- Performance analysis
+### Phase 5: Generate Report
+```bash
+python scripts/generate_report.py
+```
+Output: `results/comparison/COMPARISON_REPORT.md`
 
 ---
 
 ## Project Structure
 
 ```
-/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/
-├── CLAUDE.md                           # Project instructions
-├── IMPLEMENTATION_STATUS.md            # This file
-├── test_variants.txt                   # Original test data (8 variants)
-├── scripts/
-│   ├── prepare_truth_vcf.py           # ✓ Create truth set VCF
-│   ├── compress_vcf.py                 # ✓ Compress VCF files
-│   ├── tsv_to_vcf.py                  # Convert lab outputs
-│   ├── evaluate_callers.py            # Compare callers
-│   └── generate_report.py             # Generate report
+WORKDIR=/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/
 ├── reference/
-│   └── [symlink or copy of genome.fa needed]
+│   └── genome.fa                       # symlink → spaceranger GRCh38 (chr-prefixed)
 ├── truth_set/
-│   ├── truth_set.vcf                  # ✓ VCF with 8 variants
-│   ├── truth_set.vcf.gz               # ✓ Compressed VCF
-│   ├── truth_regions.bed              # ✓ Target regions (±1kb)
-│   └── test_variants_formatted.txt    # ✓ Formatted for lab scripts
+│   ├── truth_set.vcf.gz                # ✓ 8 somatic variants
+│   ├── truth_set.vcf.gz.tbi            # ✓ index
+│   ├── truth_regions.bed               # ✓ ±1kb target regions
+│   └── test_variants_formatted.txt     # ✓ formatted variants
+├── models/
+│   └── clair3_rna/                     # PacBio HiFi Clair3 model (to download)
+├── containers/
+│   └── deepvariant_1.6.1.sif           # ✓ present (2.7 GB)
 ├── results/
-│   ├── supervised_extraction/         # Lab supervised output
-│   ├── global_snv/                    # Lab unsupervised output
-│   ├── gatk/                          # GATK output
-│   ├── deepvariant/                   # DeepVariant output
-│   └── comparison/                    # Evaluation results
-└── containers/
-    └── [DeepVariant singularity image if needed]
+│   ├── haplotypecaller/                # GATK output
+│   ├── deepvariant/                    # DeepVariant output
+│   ├── clair3_rna/                     # Clair3-RNA output
+│   ├── longcallr/                      # LongcallR output
+│   └── comparison/                     # Evaluation results
+└── logs/                               # Per-caller log files
+
+GitHub repo (scripts tracked here):
+├── scripts/
+│   ├── run_callers.sh                  # ✓ Updated for 4 new callers
+│   ├── setup_envs.sh                   # ✓ Conda env setup
+│   ├── evaluate_callers.py             # ✓ Updated caller paths
+│   ├── generate_report.py              # ✓ Fixed f-string bug, updated callers
+│   ├── tsv_to_vcf.py
+│   ├── compress_vcf.py
+│   └── prepare_truth_vcf.py
 ```
 
 ---
 
-## Key Data & Files
+## Conda Environments
 
-**Input Data**:
-- BAM: `/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam` (11GB, indexed)
-- Genome: `/data/salomonis-archive/genomes/hg38/genome.fa` (3GB, indexed)
-- Truth variants: `test_variants.txt` → `truth_set/truth_set.vcf`
-
-**Lab Scripts**:
-- Supervised: `/data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/variant_extraction.py`
-- Unsupervised: `/data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/global_snv.py`
+| Env | Tool | Create Command |
+|-----|------|----------------|
+| `gatk-env` | GATK 4.6.2.0 | `conda create -n gatk-env -c conda-forge -c bioconda openjdk=17 gatk4=4.6.2.0 -y` |
+| `bio-cli` | samtools, bcftools, singularity | Already exists |
+| `clair3-rna` | Clair3 | `conda create -n clair3-rna -c bioconda -c conda-forge python=3.9 clair3 -y` |
+| `longcallr` | LongcallR | `conda create -n longcallr -c bioconda -c conda-forge longcallr -y` |
 
 ---
 
-## Next Steps
+## Key Notes
 
-1. **Wait for bcftools installation** to complete
-2. **Run variant callers in sequence**:
-   - Lab supervised (1-2h)
-   - Lab unsupervised chr21 test (30min)
-   - GATK (30-60min)
-   - DeepVariant (1-2h)
-3. **Convert outputs** to normalized VCF
-4. **Evaluate & compare** using evaluate_callers.py
-5. **Generate final report** with recommendations
-
----
-
-## Expected Outcomes
-
-### Minimum Success Criteria:
-- All 4 callers execute without errors
-- Detect ≥6/8 truth variants with at least one caller
-- Clear comparison metrics available
-
-### Ideal Success Criteria:
-- Detect 8/8 variants with concordance across callers
-- VAF correlation r > 0.9 for known-VAF variants
-- Clear production recommendation
-
----
-
-## Notes
-
-- **Mapping Quality**: 43% of reads have MAPQ=0 (multi-mappers) - will affect SNV detection
-- **Read Length**: ~802bp average (long reads advantage)
+- **MAPQ=0**: 43% of reads are multi-mappers → reduces SNV sensitivity
+- **Read Length**: ~802bp average (PacBio long reads)
 - **Cell Count**: ~8-10K cells per sample
 - **VAF Known**: 4 of 8 variants (8%, 28%, 35%, 37%)
-- **Frameshifts**: 2 variants (ASXL1, CBL) - SNV-only tools will miss these
+- **Frameshifts**: 2 variants (ASXL1, CBL) — require indel-capable callers
+- **Reference**: Must use chr-prefixed GRCh38 to match BAM headers
 
 ---
 
-**Last Updated**: 2026-02-13
-**Status**: Phase 2 Complete, Phase 3 Ready to Begin
+**Last Updated**: 2026-02-18
+**Status**: Phase 2 Complete, Phase 3 In Progress (installing envs)

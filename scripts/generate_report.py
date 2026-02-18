@@ -59,10 +59,10 @@ def generate_markdown_report(summary_data, csv_data, output_file):
 
 This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq data from patient 5801-diagnosis:
 
-1. **Lab Scripts (Supervised)** - Known mutations (variant_extraction.py)
-2. **Lab Scripts (Unsupervised)** - De novo discovery (global_snv.py)
-3. **GATK HaplotypeCaller** - Industry standard for RNA-seq
-4. **DeepVariant** - Deep learning-based variant caller (WGS model)
+1. **GATK HaplotypeCaller** - Industry standard, RNA-seq mode (gatk-env)
+2. **DeepVariant** - Deep learning caller, PacBio model (Singularity)
+3. **Clair3-RNA** - Long-read optimized caller with HiFi model (clair3-rna)
+4. **LongcallR** - RNA-aware long-read variant caller (longcallr)
 
 ### Key Finding Summary
 """
@@ -134,35 +134,6 @@ This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq 
 
 ## Caller Comparison
 
-### Lab Scripts (Supervised, variant_extraction.py)
-
-**Strengths**:
-- Cell-barcode aware (single-cell resolution)
-- Optimized for RNA-seq long reads
-- Supports full indel detection
-- Known to work in lab environment
-
-**Weaknesses**:
-- Requires list of mutations to search
-- Not discovery-oriented
-- Computational cost may scale poorly
-
-**Best for**: Targeted validation, cell-level genotyping
-
-### Lab Scripts (Unsupervised, global_snv.py)
-
-**Strengths**:
-- De novo discovery (no prior knowledge needed)
-- Paralog-filtering built-in
-- Returns frequency distributions
-
-**Weaknesses**:
-- SNVs only (misses frameshifts)
-- No cell barcode stratification
-- Slower for large genomes
-
-**Best for**: SNV discovery, complementary to supervised
-
 ### GATK HaplotypeCaller
 
 **Strengths**:
@@ -180,16 +151,42 @@ This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq 
 ### DeepVariant
 
 **Strengths**:
-- State-of-the-art accuracy on standard benchmarks
-- Minimal parameter tuning needed
+- State-of-the-art accuracy on PacBio benchmarks
+- PacBio model used (correct for HiFi long reads)
 - Handles complex variants well
 
 **Weaknesses**:
-- WGS model used (no RNA-seq model)
+- No RNA-seq-specific model; uses DNA PacBio model
 - Slower than traditional callers
 - Less transparency in decision-making
 
 **Best for**: High-confidence variant calls, validation
+
+### Clair3-RNA
+
+**Strengths**:
+- Designed for long-read variant calling
+- HiFi model optimized for PacBio data
+- Supports SNVs and indels
+- --haploid_sensitive mode improves somatic detection
+
+**Weaknesses**:
+- Requires appropriate pre-trained model
+- High MAPQ=0 rate may reduce sensitivity
+
+**Best for**: PacBio-specific long-read variant discovery
+
+### LongcallR
+
+**Strengths**:
+- RNA-aware variant calling
+- Native support for long reads
+- Minimal preprocessing required
+
+**Weaknesses**:
+- Newer tool, less validated in clinical settings
+
+**Best for**: RNA-seq-aware discovery from long reads
 
 ---
 
@@ -197,25 +194,24 @@ This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq 
 
 ### For Production Use:
 
-**Option A - Lab Scripts (Recommended)**
-- Use supervised extraction for known hotspots
-- Supplement with unsupervised discovery for novel variants
-- Leverages cell barcode information for single-cell resolution
-- Proven in lab environment
+**Option A - Clair3-RNA + LongcallR (Recommended for PacBio RNA-seq)**
+- Both tools optimized for long-read data
+- Consensus calls across two independent callers increases confidence
+- Covers SNVs and indels natively
 
-**Option B - Hybrid Approach**
-- Run GATK + DeepVariant in parallel
-- Take consensus calls for high confidence
-- Use for validation of lab results
+**Option B - DeepVariant (High Confidence)**
+- PacBio model provides best accuracy for HiFi reads
+- Combine with HaplotypeCaller for orthogonal validation
+- Highest confidence calls for clinical reporting
 
-**Option C - Lab + GATK**
-- Lab scripts for discovery
-- GATK for standardization
-- Best balance of innovation and reproducibility
+**Option C - HaplotypeCaller (Standard Benchmark)**
+- Industry standard; well-documented filtering strategies
+- Use as baseline comparison
+- Best for integration with existing GATK pipelines
 
 ### Validation Strategy:
-1. Call variants with lab scripts
-2. Prioritize variants with high cell support
+1. Call variants with all 4 callers
+2. Prioritize variants detected by ≥2 callers
 3. Validate frameshift mutations manually
 4. Cross-reference with known cancer databases
 
@@ -276,23 +272,25 @@ This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq 
 
 ### A. Detailed Variant List
 
-| Gene | Type | Expected_VAF | Lab_Sup | Lab_Unup | GATK | DV |
-|------|------|--------------|---------|----------|------|-----|
+| Gene | Type | Expected_VAF | HaplotypeCaller | DeepVariant | Clair3_RNA | LongcallR |
+|------|------|--------------|-----------------|-------------|------------|-----------|
 | RUNX1 | SNV | 35% | ? | ? | ? | ? |
-| ASXL1 | FS | 8% | ? | ✗ | ? | ? |
+| ASXL1 | FS | 8% | ? | ? | ? | ? |
 | SETBP1 | SNV | 28% | ? | ? | ? | ? |
 | SRSF2 | SNV | 37% | ? | ? | ? | ? |
-| CBL | FS | UNK | ? | ✗ | ? | ? |
+| CBL | FS | UNK | ? | ? | ? | ? |
 | MEF2B | SNV | UNK | ? | ? | ? | ? |
 | BCOR | SNV | UNK | ? | ? | ? | ? |
 | PHF6 | SNV | UNK | ? | ? | ? | ? |
 
 ### B. Software Versions
 
-- samtools: {samtools_version}
-- GATK: 4.6.x
-- DeepVariant: 1.6.1
-- bcftools: 1.23 (when installed)
+- samtools: 1.23
+- GATK: 4.6.2.0 (gatk-env)
+- DeepVariant: 1.6.1 (Singularity)
+- Clair3: bioconda latest (clair3-rna)
+- LongcallR: bioconda latest (longcallr)
+- bcftools: 1.23
 
 ### C. File Locations
 
@@ -302,10 +300,10 @@ This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq 
 - Truth Set: `./truth_set/truth_set.vcf.gz`
 
 **Results**:
-- Lab Supervised: `./results/supervised_extraction/`
-- Lab Unsupervised: `./results/global_snv/`
-- GATK: `./results/gatk/`
+- HaplotypeCaller: `./results/haplotypecaller/`
 - DeepVariant: `./results/deepvariant/`
+- Clair3-RNA: `./results/clair3_rna/`
+- LongcallR: `./results/longcallr/`
 - Evaluation: `./results/comparison/`
 
 ---
@@ -314,12 +312,12 @@ This report evaluates four variant calling approaches on PacBio Iso-Seq RNA-seq 
 
 The choice of variant caller depends on project-specific priorities:
 
-- **Accuracy + Cell Resolution**: Lab Scripts (Supervised)
-- **Discovery Mode**: Lab Scripts + GATK
-- **Maximum Confidence**: DeepVariant (with validation)
-- **Standard Workflow**: GATK + Lab Scripts
+- **PacBio-Optimized Discovery**: Clair3-RNA + LongcallR
+- **Maximum Confidence**: DeepVariant (PacBio model)
+- **Standard Benchmark**: HaplotypeCaller
+- **Consensus Approach**: Variants detected by ≥2 callers
 
-Recommend implementing **Lab Scripts approach** for production given proven track record and single-cell capabilities.
+Recommend implementing a **consensus approach** using Clair3-RNA and LongcallR as primary callers with DeepVariant for high-confidence validation.
 
 ---
 

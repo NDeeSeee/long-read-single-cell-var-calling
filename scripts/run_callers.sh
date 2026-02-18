@@ -3,21 +3,25 @@
 # Run all variant callers for comparison
 # Usage: ./run_callers.sh [caller_name|all]
 # Example: ./run_callers.sh all
-#          ./run_callers.sh lab_supervised
+#          ./run_callers.sh haplotypecaller
+#          ./run_callers.sh deepvariant
+#          ./run_callers.sh clair3_rna
+#          ./run_callers.sh longcallr
 #
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
+
+# Working directory: all data, results, models live here
+WORKDIR="/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall"
 
 BAM="/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam"
-REFERENCE="$PROJECT_DIR/reference/genome.fa"
-TRUTH_BED="$PROJECT_DIR/truth_set/truth_regions.bed"
-TRUTH_VARIANTS="$PROJECT_DIR/truth_set/test_variants_formatted.txt"
+REFERENCE="$WORKDIR/reference/genome.fa"
+TRUTH_BED="$WORKDIR/truth_set/truth_regions.bed"
 
-LOG_DIR="$PROJECT_DIR/logs"
+LOG_DIR="$WORKDIR/logs"
 mkdir -p "$LOG_DIR"
 
 CALLER="${1:-all}"
@@ -27,175 +31,118 @@ echo "[INFO] BAM: $BAM"
 echo "[INFO] Reference: $REFERENCE"
 echo "[INFO] Target caller: $CALLER"
 
-# ============================================================================
-# LAB SCRIPT 1: Supervised variant extraction
-# ============================================================================
-run_lab_supervised() {
-    echo ""
-    echo "========================================================================"
-    echo "[CALLER] Lab Script - Supervised (variant_extraction.py)"
-    echo "========================================================================"
+# ── Tool paths ─────────────────────────────────────────────────────────────
+# Detect conda envs directory dynamically (works on Linux server and macOS)
+_CONDA_BIN="${CONDA_EXE:-$(command -v conda 2>/dev/null)}"
+if [ -n "$_CONDA_BIN" ]; then
+    CONDA_BASE="$("$_CONDA_BIN" info --base 2>/dev/null)/envs"
+else
+    # Fallback: common server path
+    CONDA_BASE="/users/pavb5f/.conda/envs"
+fi
 
-    CALLER_SCRIPT="/data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/variant_extraction.py"
-    OUTPUT_DIR="$PROJECT_DIR/results/supervised_extraction"
-    LOG_FILE="$LOG_DIR/lab_supervised.log"
+GATK_BIN="$CONDA_BASE/gatk-env/bin/gatk"
+GATK_ENV_BIN="$CONDA_BASE/gatk-env/bin"  # GATK wrapper needs python on PATH
 
-    mkdir -p "$OUTPUT_DIR"
+# Clair3: prefer Singularity on Linux; fall back to Docker on macOS
+CLAIR3_DOCKER_IMAGE="hkubal/clair3:latest"
+CLAIR3_SIF="$WORKDIR/containers/clair3_latest.sif"
 
-    echo "[INFO] Running variant_extraction.py..."
-    echo "[INFO] Output: $OUTPUT_DIR"
-    echo "[INFO] Log: $LOG_FILE"
+# LongcallR: original C++ tool is not on bioconda; use BioContainers image
+# (longcallR_nn in conda env is a different deep-learning tool requiring feature extraction)
+LONGCALLR_DOCKER_IMAGE="quay.io/biocontainers/longcallr:1.12.0--py312h67e1f27_0"
+LONGCALLR_SIF="$WORKDIR/containers/longcallr_1.12.0.sif"
 
-    python "$CALLER_SCRIPT" \
-        --sample 5801-diagnosis \
-        --bam "$BAM" \
-        --mutations "$TRUTH_VARIANTS" \
-        --reference "$REFERENCE" \
-        --output-dir "$OUTPUT_DIR" \
-        2>&1 | tee "$LOG_FILE"
-
-    echo "[SUCCESS] Lab supervised extraction complete"
-    echo "[INFO] Converting TSV to VCF..."
-    python "$SCRIPT_DIR/tsv_to_vcf.py" \
-        "$OUTPUT_DIR/5801-diagnosis_complete_analysis.tsv" \
-        "$OUTPUT_DIR/lab_supervised.vcf" 2>&1 | tee -a "$LOG_FILE"
-
-    echo "[INFO] Compressing VCF..."
-    python "$SCRIPT_DIR/compress_vcf.py" "$OUTPUT_DIR/lab_supervised.vcf"
-}
-
-# ============================================================================
-# LAB SCRIPT 2: Unsupervised SNV discovery
-# ============================================================================
-run_lab_unsupervised() {
-    echo ""
-    echo "========================================================================"
-    echo "[CALLER] Lab Script - Unsupervised (global_snv.py)"
-    echo "========================================================================"
-
-    CALLER_SCRIPT="/data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/global_snv.py"
-    OUTPUT_DIR="$PROJECT_DIR/results/global_snv"
-    LOG_FILE="$LOG_DIR/lab_unsupervised.log"
-
-    mkdir -p "$OUTPUT_DIR"
-
-    echo "[INFO] Running global_snv.py (chr21 test)..."
-    echo "[INFO] Output: $OUTPUT_DIR"
-    echo "[INFO] Log: $LOG_FILE"
-
-    python "$CALLER_SCRIPT" \
-        "$BAM" \
-        "$REFERENCE" \
-        "$OUTPUT_DIR/chr21_output.txt" \
-        --test_chromosome chr21 \
-        --min_reads 10 \
-        --min_percent 5.0 \
-        2>&1 | tee "$LOG_FILE"
-
-    echo "[SUCCESS] Lab unsupervised extraction complete"
-    echo "[INFO] Chr21 test complete. To run full genome:"
-    echo "[INFO]   python $CALLER_SCRIPT \\"
-    echo "[INFO]     $BAM \\"
-    echo "[INFO]     $REFERENCE \\"
-    echo "[INFO]     $OUTPUT_DIR/genome_output.txt \\"
-    echo "[INFO]     --min_reads 50 --min_percent 8.0"
-}
+BGZIP_BIN="$CONDA_BASE/bio-cli/bin/bgzip"
+BCFTOOLS_BIN="$CONDA_BASE/bio-cli/bin/bcftools"
+SINGULARITY_BIN="$CONDA_BASE/bio-cli/bin/singularity"
+DV_SIF="$WORKDIR/containers/deepvariant_1.6.1.sif"
+CLAIR3_MODEL="$WORKDIR/models/clair3_rna"
 
 # ============================================================================
 # GATK HaplotypeCaller
 # ============================================================================
-run_gatk() {
+run_haplotypecaller() {
     echo ""
     echo "========================================================================"
-    echo "[CALLER] GATK HaplotypeCaller (RNA-seq mode via Singularity)"
+    echo "[CALLER] GATK HaplotypeCaller"
     echo "========================================================================"
 
-    OUTPUT_DIR="$PROJECT_DIR/results/haplotypecaller"
-    LOG_FILE="$LOG_DIR/gatk.log"
-    CONTAINER="$PROJECT_DIR/containers/gatk.sif"
-    SINGULARITY="/users/pavb5f/.conda/envs/bio-cli/bin/singularity"
+    OUTPUT_DIR="$WORKDIR/results/haplotypecaller"
+    LOG_FILE="$LOG_DIR/haplotypecaller.log"
 
     mkdir -p "$OUTPUT_DIR"
 
-    if [ ! -f "$CONTAINER" ]; then
-        echo "[ERROR] GATK container not found at $CONTAINER"
-        echo "[ERROR] Pull with: singularity pull containers/gatk.sif docker://broadinstitute/gatk:latest"
-        return 1
+    if [ ! -f "$GATK_BIN" ]; then
+        echo "[ERROR] GATK not found at $GATK_BIN"
+        echo "[INFO] Create env: conda create -n gatk-env -c conda-forge -c bioconda openjdk=17 gatk4=4.6.2.0 -y"
+        exit 1
     fi
 
     echo "[INFO] Running GATK HaplotypeCaller..."
-    echo "[INFO] Container: $CONTAINER"
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    # Call variants
-    echo "[STEP] HaplotypeCaller..." | tee "$LOG_FILE"
-    $SINGULARITY exec \
-        --bind /data:/data \
-        --bind "$PROJECT_DIR:$PROJECT_DIR" \
-        "$CONTAINER" \
-        gatk HaplotypeCaller \
-            -R "$REFERENCE" \
-            -I "$BAM" \
-            -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
-            --dont-use-soft-clipped-bases \
-            --min-base-quality-score 10 \
-            -L "$TRUTH_BED" \
-            --native-pair-hmm-threads 8 \
-            --sample-name 5801-diagnosis \
-            2>&1 | tee -a "$LOG_FILE"
+    # Prepend gatk-env bin so the gatk wrapper finds 'python'
+    PATH="$GATK_ENV_BIN:$PATH" "$GATK_BIN" HaplotypeCaller \
+        -R "$REFERENCE" \
+        -I "$BAM" \
+        -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
+        -L "$TRUTH_BED" \
+        --dont-use-soft-clipped-bases \
+        --min-base-quality-score 10 \
+        --native-pair-hmm-threads 8 \
+        --sample-name 5801-diagnosis \
+        2>&1 | tee "$LOG_FILE"
 
-    # Check if output exists
-    if [ ! -f "$OUTPUT_DIR/variants_raw.vcf.gz" ]; then
-        echo "[ERROR] GATK did not produce output VCF"
-        return 1
-    fi
-
-    # Normalize and index with bcftools
-    echo "[STEP] Normalizing VCF..." | tee -a "$LOG_FILE"
-    /users/pavb5f/.conda/envs/bio-cli/bin/bcftools norm -f "$REFERENCE" -m -any \
+    echo "[STEP] Normalizing..." | tee -a "$LOG_FILE"
+    "$BCFTOOLS_BIN" norm -f "$REFERENCE" -m -any \
         "$OUTPUT_DIR/variants_raw.vcf.gz" | \
-        /users/pavb5f/.conda/envs/bio-cli/bin/bcftools sort -Oz -o "$OUTPUT_DIR/variants.vcf.gz" \
-        2>&1 | tee -a "$LOG_FILE"
+        "$BCFTOOLS_BIN" sort -Oz -o "$OUTPUT_DIR/variants.vcf.gz"
+    "$BCFTOOLS_BIN" index -t "$OUTPUT_DIR/variants.vcf.gz"
 
-    /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/variants.vcf.gz"
-
-    echo "[SUCCESS] GATK analysis complete"
+    echo "[SUCCESS] HaplotypeCaller analysis complete"
     echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
 }
 
 # ============================================================================
-# DeepVariant
+# DeepVariant (PacBio model via Singularity)
 # ============================================================================
 run_deepvariant() {
     echo ""
     echo "========================================================================"
-    echo "[CALLER] DeepVariant (PacBio model via Singularity)"
+    echo "[CALLER] DeepVariant (PACBIO model via Singularity)"
     echo "========================================================================"
 
-    OUTPUT_DIR="$PROJECT_DIR/results/deepvariant"
+    OUTPUT_DIR="$WORKDIR/results/deepvariant"
     LOG_FILE="$LOG_DIR/deepvariant.log"
-    CONTAINER="$PROJECT_DIR/containers/deepvariant_1.6.1.sif"
-    SINGULARITY="/users/pavb5f/.conda/envs/bio-cli/bin/singularity"
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Check if container exists
-    if [ ! -f "$CONTAINER" ]; then
-        echo "[ERROR] DeepVariant container not found at $CONTAINER"
-        echo "[ERROR] Please copy deepvariant_1.6.1.sif to containers/ directory"
-        return 1
+    # If container is still at project root, move it into containers/
+    if [ ! -f "$DV_SIF" ]; then
+        ROOT_SIF="$PROJECT_DIR/deepvariant_1.6.1.sif"
+        if [ -f "$ROOT_SIF" ]; then
+            echo "[INFO] Moving container from project root to containers/ directory..."
+            mkdir -p "$(dirname "$DV_SIF")"
+            mv "$ROOT_SIF" "$DV_SIF"
+        else
+            echo "[INFO] DeepVariant container not found. Pulling from Docker Hub..."
+            mkdir -p "$(dirname "$DV_SIF")"
+            "$SINGULARITY_BIN" pull --dir "$(dirname "$DV_SIF")" \
+                docker://google/deepvariant:1.6.1
+        fi
     fi
 
     echo "[INFO] Running DeepVariant..."
-    echo "[INFO] Container: $CONTAINER"
+    echo "[INFO] Container: $DV_SIF"
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    $SINGULARITY exec \
+    "$SINGULARITY_BIN" exec \
         --bind /data:/data \
-        --bind "$PROJECT_DIR:$PROJECT_DIR" \
-        "$CONTAINER" \
+        --bind "$WORKDIR:$WORKDIR" \
+        "$DV_SIF" \
         /opt/deepvariant/bin/run_deepvariant \
             --model_type=PACBIO \
             --ref="$REFERENCE" \
@@ -205,117 +152,159 @@ run_deepvariant() {
             --num_shards=8 \
             2>&1 | tee "$LOG_FILE"
 
-    # Index output VCF
-    /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/variants.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
+    "$BCFTOOLS_BIN" index -t "$OUTPUT_DIR/variants.vcf.gz"
 
     echo "[SUCCESS] DeepVariant analysis complete"
     echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
 }
 
 # ============================================================================
-# Clair3-RNA
+# Clair3-RNA (PacBio HiFi model)
+# Singularity on Linux servers; Docker on macOS
 # ============================================================================
 run_clair3_rna() {
     echo ""
     echo "========================================================================"
-    echo "[CALLER] Clair3-RNA (Long-read RNA variant calling)"
+    echo "[CALLER] Clair3 (PacBio HiFi / hifi platform)"
     echo "========================================================================"
 
-    OUTPUT_DIR="$PROJECT_DIR/results/clair3_rna"
+    OUTPUT_DIR="$WORKDIR/results/clair3_rna"
     LOG_FILE="$LOG_DIR/clair3_rna.log"
 
     mkdir -p "$OUTPUT_DIR"
 
-    echo "[INFO] Running Clair3-RNA..."
+    if [ ! -d "$CLAIR3_MODEL" ]; then
+        echo "[ERROR] Clair3 model directory not found at $CLAIR3_MODEL"
+        echo "[INFO] Run: bash scripts/setup_envs.sh clair3"
+        echo "[INFO] Or download from: https://github.com/HKU-BAL/Clair3#pre-trained-models"
+        exit 1
+    fi
+
+    # Determine runtime: Singularity (Linux) or Docker (macOS)
+    if [ -f "$CLAIR3_SIF" ] && command -v singularity &>/dev/null; then
+        echo "[INFO] Using Singularity container: $CLAIR3_SIF"
+        _CLAIR3_RUN() {
+            "$SINGULARITY_BIN" exec \
+                --bind /data:/data \
+                --bind "$WORKDIR:$WORKDIR" \
+                "$CLAIR3_SIF" \
+                /usr/local/bin/run_clair3.sh "$@"
+        }
+    elif command -v docker &>/dev/null; then
+        echo "[INFO] Using Docker image: $CLAIR3_DOCKER_IMAGE"
+        _CLAIR3_RUN() {
+            docker run --rm --platform linux/amd64 \
+                -v /data:/data \
+                -v "$WORKDIR:$WORKDIR" \
+                "$CLAIR3_DOCKER_IMAGE" \
+                run_clair3.sh "$@"
+        }
+    else
+        echo "[ERROR] Neither Singularity nor Docker found. Install one to run Clair3."
+        echo "[INFO] macOS: brew install --cask docker"
+        echo "[INFO] Linux: singularity pull $CLAIR3_SIF docker://$CLAIR3_DOCKER_IMAGE"
+        exit 1
+    fi
+
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    CLAIR3_ENV="/users/pavb5f/.conda/envs/clair3-rna/bin/run_clair3.sh"
-
-    if [ ! -x "$CLAIR3_ENV" ]; then
-        echo "[ERROR] Clair3-RNA not found at $CLAIR3_ENV"
-        echo "[ERROR] Please create clair3-rna conda environment first"
-        return 1
-    fi
-
-    # Run Clair3-RNA
-    $CLAIR3_ENV \
+    _CLAIR3_RUN \
         --bam_fn="$BAM" \
         --ref_fn="$REFERENCE" \
         --threads=16 \
         --platform="hifi" \
+        --model_path="$CLAIR3_MODEL" \
         --output="$OUTPUT_DIR" \
         --bed_fn="$TRUTH_BED" \
+        --include_all_ctgs \
+        --no_phasing_for_fa \
+        --haploid_sensitive \
         2>&1 | tee "$LOG_FILE"
 
-    # Index output VCF
-    if [ -f "$OUTPUT_DIR/merge_output.vcf.gz" ]; then
-        /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/merge_output.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
-        echo "[SUCCESS] Clair3-RNA analysis complete"
-        echo "[INFO] Output: $OUTPUT_DIR/merge_output.vcf.gz"
-    else
-        echo "[ERROR] Clair3-RNA did not produce output VCF"
-    fi
+    echo "[SUCCESS] Clair3-RNA analysis complete"
+    echo "[INFO] Output: $OUTPUT_DIR/merge_output.vcf.gz"
 }
 
 # ============================================================================
-# LongcallR
+# LongcallR (BioContainers: Singularity on Linux, Docker on macOS)
 # ============================================================================
 run_longcallr() {
     echo ""
     echo "========================================================================"
-    echo "[CALLER] LongcallR (Long-read variant calling)"
+    echo "[CALLER] LongcallR"
     echo "========================================================================"
 
-    OUTPUT_DIR="$PROJECT_DIR/results/longcallr"
+    OUTPUT_DIR="$WORKDIR/results/longcallr"
     LOG_FILE="$LOG_DIR/longcallr.log"
 
     mkdir -p "$OUTPUT_DIR"
 
-    echo "[INFO] Running LongcallR..."
+    # Determine runtime: Singularity (Linux) or Docker (macOS)
+    if [ -f "$LONGCALLR_SIF" ] && command -v singularity &>/dev/null; then
+        echo "[INFO] Using Singularity container: $LONGCALLR_SIF"
+        _LONGCALLR_RUN() {
+            "$SINGULARITY_BIN" exec \
+                --bind /data:/data \
+                --bind "$WORKDIR:$WORKDIR" \
+                "$LONGCALLR_SIF" \
+                longcallr "$@"
+        }
+    elif command -v docker &>/dev/null; then
+        echo "[INFO] Using Docker image: $LONGCALLR_DOCKER_IMAGE"
+        if ! docker image inspect "$LONGCALLR_DOCKER_IMAGE" &>/dev/null; then
+            echo "[INFO] Pulling Docker image..."
+            docker pull --platform linux/amd64 "$LONGCALLR_DOCKER_IMAGE"
+        fi
+        _LONGCALLR_RUN() {
+            docker run --rm --platform linux/amd64 \
+                -v /data:/data \
+                -v "$WORKDIR:$WORKDIR" \
+                "$LONGCALLR_DOCKER_IMAGE" \
+                longcallR "$@"
+        }
+    else
+        echo "[ERROR] Neither Singularity SIF nor Docker found."
+        echo "[INFO] Linux: singularity pull $LONGCALLR_SIF docker://$LONGCALLR_DOCKER_IMAGE"
+        echo "[INFO] macOS: start Docker Desktop, then re-run."
+        exit 1
+    fi
+
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    LONGCALLR_BIN="/users/pavb5f/.conda/envs/longcallr/bin/longcallr"
+    # Chromosomes containing truth variants
+    CONTIGS="chr11 chr17 chr18 chr19 chr20 chr21 chrX"
 
-    if [ ! -x "$LONGCALLR_BIN" ]; then
-        echo "[ERROR] LongcallR not found at $LONGCALLR_BIN"
-        echo "[ERROR] Please create longcallr conda environment first"
-        return 1
-    fi
-
-    # Run LongcallR
-    $LONGCALLR_BIN variants \
-        -f "$REFERENCE" \
-        -b "$BAM" \
-        -o "$OUTPUT_DIR/variants.vcf" \
-        -r "$TRUTH_BED" \
+    _LONGCALLR_RUN \
+        --bam-path "$BAM" \
+        --ref-path "$REFERENCE" \
+        --output "$OUTPUT_DIR/variants" \
+        --preset hifi-isoseq \
+        --contigs $CONTIGS \
         --threads 16 \
+        --min-allele-freq 0.05 \
+        --low-allele-frac-cutoff 0.03 \
+        --min-mapq 1 \
+        --no-bam-output \
         2>&1 | tee "$LOG_FILE"
 
-    # Compress and index
+    # longcallR writes output as prefix.vcf — compress and index
     if [ -f "$OUTPUT_DIR/variants.vcf" ]; then
-        /users/pavb5f/.conda/envs/bio-cli/bin/bgzip -f "$OUTPUT_DIR/variants.vcf"
-        /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/variants.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
-        echo "[SUCCESS] LongcallR analysis complete"
-        echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
-    else
-        echo "[ERROR] LongcallR did not produce output VCF"
+        "$BGZIP_BIN" "$OUTPUT_DIR/variants.vcf"
     fi
+    "$BCFTOOLS_BIN" index -t "$OUTPUT_DIR/variants.vcf.gz"
+
+    echo "[SUCCESS] LongcallR analysis complete"
+    echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
 }
 
 # ============================================================================
 # Main entry point
 # ============================================================================
 case "$CALLER" in
-    lab_supervised)
-        run_lab_supervised
-        ;;
-    lab_unsupervised)
-        run_lab_unsupervised
-        ;;
-    gatk)
-        run_gatk
+    haplotypecaller|gatk)
+        run_haplotypecaller
         ;;
     deepvariant)
         run_deepvariant
@@ -327,16 +316,14 @@ case "$CALLER" in
         run_longcallr
         ;;
     all)
-        run_lab_supervised
-        run_lab_unsupervised
-        run_gatk
+        run_haplotypecaller
         run_deepvariant
         run_clair3_rna
         run_longcallr
         ;;
     *)
         echo "[ERROR] Unknown caller: $CALLER"
-        echo "Usage: $0 [lab_supervised|lab_unsupervised|gatk|deepvariant|clair3_rna|longcallr|all]"
+        echo "Usage: $0 [haplotypecaller|deepvariant|clair3_rna|longcallr|all]"
         exit 1
         ;;
 esac
@@ -345,5 +332,5 @@ echo ""
 echo "========================================================================"
 echo "[COMPLETE] Caller execution finished: $CALLER"
 echo "========================================================================"
-echo "[INFO] Results available in: $PROJECT_DIR/results/"
+echo "[INFO] Results available in: $WORKDIR/results/"
 echo ""
