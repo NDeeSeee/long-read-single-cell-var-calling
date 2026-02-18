@@ -110,7 +110,7 @@ run_gatk() {
     echo "[CALLER] GATK HaplotypeCaller (RNA-seq mode)"
     echo "========================================================================"
 
-    OUTPUT_DIR="$PROJECT_DIR/results/gatk"
+    OUTPUT_DIR="$PROJECT_DIR/results/haplotypecaller"
     LOG_FILE="$LOG_DIR/gatk.log"
 
     mkdir -p "$OUTPUT_DIR"
@@ -119,31 +119,39 @@ run_gatk() {
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
+    # Try to use GATK from isolated environment
+    GATK_ENV="/users/pavb5f/.conda/envs/gatk-env-v2/bin/gatk"
+
+    if [ ! -x "$GATK_ENV" ]; then
+        echo "[ERROR] GATK not found at $GATK_ENV"
+        echo "[ERROR] Please create gatk-env-v2 conda environment first"
+        return 1
+    fi
+
     # Call variants
     echo "[STEP] HaplotypeCaller..." | tee "$LOG_FILE"
-    gatk HaplotypeCaller \
+    $GATK_ENV HaplotypeCaller \
         -R "$REFERENCE" \
         -I "$BAM" \
         -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
         --dont-use-soft-clipped-bases \
-        --standard-min-confidence-threshold-for-calling 20.0 \
         --min-base-quality-score 10 \
         -L "$TRUTH_BED" \
         --native-pair-hmm-threads 8 \
+        --sample-name 5801-diagnosis \
         2>&1 | tee -a "$LOG_FILE"
 
-    # Filter variants
-    echo "[STEP] VariantFiltration..." | tee -a "$LOG_FILE"
-    gatk VariantFiltration \
-        -R "$REFERENCE" \
-        -V "$OUTPUT_DIR/variants_raw.vcf.gz" \
-        -O "$OUTPUT_DIR/variants_filtered.vcf.gz" \
-        --filter-name "LowQual" --filter-expression "QUAL < 30.0" \
-        --filter-name "LowDepth" --filter-expression "DP < 10" \
+    # Normalize and index with bcftools
+    echo "[STEP] Normalizing VCF..." | tee -a "$LOG_FILE"
+    /users/pavb5f/.conda/envs/bio-cli/bin/bcftools norm -f "$REFERENCE" -m -any \
+        "$OUTPUT_DIR/variants_raw.vcf.gz" | \
+        /users/pavb5f/.conda/envs/bio-cli/bin/bcftools sort -Oz -o "$OUTPUT_DIR/variants.vcf.gz" \
         2>&1 | tee -a "$LOG_FILE"
+
+    /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/variants.vcf.gz"
 
     echo "[SUCCESS] GATK analysis complete"
-    echo "[INFO] Output: $OUTPUT_DIR/variants_filtered.vcf.gz"
+    echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
 }
 
 # ============================================================================
@@ -152,22 +160,21 @@ run_gatk() {
 run_deepvariant() {
     echo ""
     echo "========================================================================"
-    echo "[CALLER] DeepVariant (WGS model via Singularity)"
+    echo "[CALLER] DeepVariant (PacBio model via Singularity)"
     echo "========================================================================"
 
     OUTPUT_DIR="$PROJECT_DIR/results/deepvariant"
     LOG_FILE="$LOG_DIR/deepvariant.log"
     CONTAINER="$PROJECT_DIR/containers/deepvariant_1.6.1.sif"
+    SINGULARITY="/users/pavb5f/.conda/envs/bio-cli/bin/singularity"
 
     mkdir -p "$OUTPUT_DIR"
 
     # Check if container exists
     if [ ! -f "$CONTAINER" ]; then
-        echo "[INFO] DeepVariant container not found. Downloading..."
-        mkdir -p "$PROJECT_DIR/containers"
-        cd "$PROJECT_DIR/containers"
-        singularity pull docker://google/deepvariant:1.6.1
-        cd "$PROJECT_DIR"
+        echo "[ERROR] DeepVariant container not found at $CONTAINER"
+        echo "[ERROR] Please copy deepvariant_1.6.1.sif to containers/ directory"
+        return 1
     fi
 
     echo "[INFO] Running DeepVariant..."
@@ -175,22 +182,116 @@ run_deepvariant() {
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    singularity exec \
+    $SINGULARITY exec \
         --bind /data:/data \
+        --bind "$PROJECT_DIR:$PROJECT_DIR" \
         "$CONTAINER" \
         /opt/deepvariant/bin/run_deepvariant \
-            --model_type=WGS \
+            --model_type=PACBIO \
             --ref="$REFERENCE" \
             --reads="$BAM" \
             --regions="$TRUTH_BED" \
             --output_vcf="$OUTPUT_DIR/variants.vcf.gz" \
-            --output_gvcf="$OUTPUT_DIR/variants.g.vcf.gz" \
             --num_shards=8 \
-            --make_examples_extra_args="min_mapping_quality=1" \
             2>&1 | tee "$LOG_FILE"
+
+    # Index output VCF
+    /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/variants.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
 
     echo "[SUCCESS] DeepVariant analysis complete"
     echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
+}
+
+# ============================================================================
+# Clair3-RNA
+# ============================================================================
+run_clair3_rna() {
+    echo ""
+    echo "========================================================================"
+    echo "[CALLER] Clair3-RNA (Long-read RNA variant calling)"
+    echo "========================================================================"
+
+    OUTPUT_DIR="$PROJECT_DIR/results/clair3_rna"
+    LOG_FILE="$LOG_DIR/clair3_rna.log"
+
+    mkdir -p "$OUTPUT_DIR"
+
+    echo "[INFO] Running Clair3-RNA..."
+    echo "[INFO] Output: $OUTPUT_DIR"
+    echo "[INFO] Log: $LOG_FILE"
+
+    CLAIR3_ENV="/users/pavb5f/.conda/envs/clair3-rna/bin/run_clair3.sh"
+
+    if [ ! -x "$CLAIR3_ENV" ]; then
+        echo "[ERROR] Clair3-RNA not found at $CLAIR3_ENV"
+        echo "[ERROR] Please create clair3-rna conda environment first"
+        return 1
+    fi
+
+    # Run Clair3-RNA
+    $CLAIR3_ENV \
+        --bam_fn="$BAM" \
+        --ref_fn="$REFERENCE" \
+        --threads=16 \
+        --platform="hifi" \
+        --output="$OUTPUT_DIR" \
+        --bed_fn="$TRUTH_BED" \
+        2>&1 | tee "$LOG_FILE"
+
+    # Index output VCF
+    if [ -f "$OUTPUT_DIR/merge_output.vcf.gz" ]; then
+        /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/merge_output.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
+        echo "[SUCCESS] Clair3-RNA analysis complete"
+        echo "[INFO] Output: $OUTPUT_DIR/merge_output.vcf.gz"
+    else
+        echo "[ERROR] Clair3-RNA did not produce output VCF"
+    fi
+}
+
+# ============================================================================
+# LongcallR
+# ============================================================================
+run_longcallr() {
+    echo ""
+    echo "========================================================================"
+    echo "[CALLER] LongcallR (Long-read variant calling)"
+    echo "========================================================================"
+
+    OUTPUT_DIR="$PROJECT_DIR/results/longcallr"
+    LOG_FILE="$LOG_DIR/longcallr.log"
+
+    mkdir -p "$OUTPUT_DIR"
+
+    echo "[INFO] Running LongcallR..."
+    echo "[INFO] Output: $OUTPUT_DIR"
+    echo "[INFO] Log: $LOG_FILE"
+
+    LONGCALLR_BIN="/users/pavb5f/.conda/envs/longcallr/bin/longcallr"
+
+    if [ ! -x "$LONGCALLR_BIN" ]; then
+        echo "[ERROR] LongcallR not found at $LONGCALLR_BIN"
+        echo "[ERROR] Please create longcallr conda environment first"
+        return 1
+    fi
+
+    # Run LongcallR
+    $LONGCALLR_BIN variants \
+        -f "$REFERENCE" \
+        -b "$BAM" \
+        -o "$OUTPUT_DIR/variants.vcf" \
+        -r "$TRUTH_BED" \
+        --threads 16 \
+        2>&1 | tee "$LOG_FILE"
+
+    # Compress and index
+    if [ -f "$OUTPUT_DIR/variants.vcf" ]; then
+        /users/pavb5f/.conda/envs/bio-cli/bin/bgzip -f "$OUTPUT_DIR/variants.vcf"
+        /users/pavb5f/.conda/envs/bio-cli/bin/bcftools index -t "$OUTPUT_DIR/variants.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
+        echo "[SUCCESS] LongcallR analysis complete"
+        echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
+    else
+        echo "[ERROR] LongcallR did not produce output VCF"
+    fi
 }
 
 # ============================================================================
@@ -209,15 +310,23 @@ case "$CALLER" in
     deepvariant)
         run_deepvariant
         ;;
+    clair3_rna)
+        run_clair3_rna
+        ;;
+    longcallr)
+        run_longcallr
+        ;;
     all)
         run_lab_supervised
         run_lab_unsupervised
         run_gatk
         run_deepvariant
+        run_clair3_rna
+        run_longcallr
         ;;
     *)
         echo "[ERROR] Unknown caller: $CALLER"
-        echo "Usage: $0 [lab_supervised|lab_unsupervised|gatk|deepvariant|all]"
+        echo "Usage: $0 [lab_supervised|lab_unsupervised|gatk|deepvariant|clair3_rna|longcallr|all]"
         exit 1
         ;;
 esac

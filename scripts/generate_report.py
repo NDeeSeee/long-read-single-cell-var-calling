@@ -6,7 +6,19 @@ Generate comprehensive comparison report from evaluation results.
 import os
 import sys
 import json
+import subprocess
 from datetime import datetime
+
+def get_tool_version(tool_name):
+    """Get version of a tool by running it with --version flag."""
+    try:
+        result = subprocess.run([tool_name, '--version'],
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return result.stdout.strip().split('\n')[0]
+        return "unknown"
+    except:
+        return "unknown"
 
 def read_json_summary(summary_file):
     """Read evaluation summary JSON."""
@@ -35,6 +47,7 @@ def read_csv_summary(csv_file):
 def generate_markdown_report(summary_data, csv_data, output_file):
     """Generate markdown report."""
     headers, rows = csv_data if csv_data else (None, None)
+    samtools_version = get_tool_version('samtools')
 
     report = f"""# Variant Caller Comparison Report
 
