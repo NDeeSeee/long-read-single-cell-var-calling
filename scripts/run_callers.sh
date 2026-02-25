@@ -18,6 +18,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 WORKDIR="/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall"
 
 BAM="/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam"
+BAM_QUAL="$WORKDIR/scisoseq_synthetic_qual.bam"  # Full BAM with synthetic quality preprocessing
 REFERENCE="$WORKDIR/reference/genome.fa"
 TRUTH_BED="$WORKDIR/truth_set/truth_regions.bed"
 
@@ -35,7 +36,14 @@ echo "[INFO] Target caller: $CALLER"
 # Detect conda envs directory dynamically (works on Linux server and macOS)
 _CONDA_BIN="${CONDA_EXE:-$(command -v conda 2>/dev/null)}"
 if [ -n "$_CONDA_BIN" ]; then
-    CONDA_BASE="$("$_CONDA_BIN" info --base 2>/dev/null)/envs"
+    _CONDA_BASE_DETECTED="$("$_CONDA_BIN" info --base 2>/dev/null)/envs"
+    # Verify detected path has our envs; fallback if not
+    if [ -d "$_CONDA_BASE_DETECTED/bio-cli" ]; then
+        CONDA_BASE="$_CONDA_BASE_DETECTED"
+    else
+        # Fallback: common server path
+        CONDA_BASE="/users/pavb5f/.conda/envs"
+    fi
 else
     # Fallback: common server path
     CONDA_BASE="/users/pavb5f/.conda/envs"
@@ -86,13 +94,11 @@ run_haplotypecaller() {
     # Prepend gatk-env bin so the gatk wrapper finds 'python'
     PATH="$GATK_ENV_BIN:$PATH" "$GATK_BIN" HaplotypeCaller \
         -R "$REFERENCE" \
-        -I "$BAM" \
+        -I "$BAM_QUAL" \
         -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
-        -L "$TRUTH_BED" \
         --dont-use-soft-clipped-bases \
         --min-base-quality-score 10 \
         --native-pair-hmm-threads 8 \
-        --sample-name 5801-diagnosis \
         2>&1 | tee "$LOG_FILE"
 
     echo "[STEP] Normalizing..." | tee -a "$LOG_FILE"
@@ -102,6 +108,58 @@ run_haplotypecaller() {
     "$BCFTOOLS_BIN" index -t "$OUTPUT_DIR/variants.vcf.gz"
 
     echo "[SUCCESS] HaplotypeCaller analysis complete"
+    echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
+}
+
+# ============================================================================
+# GATK HaplotypeCaller - Sensitive Mode (Lower Detection Threshold)
+# ============================================================================
+run_haplotypecaller_sensitive() {
+    echo ""
+    echo "========================================================================"
+    echo "[CALLER] GATK HaplotypeCaller (SENSITIVE - Lower Thresholds)"
+    echo "========================================================================"
+
+    OUTPUT_DIR="$WORKDIR/results/haplotypecaller_sensitive"
+    LOG_FILE="$LOG_DIR/haplotypecaller_sensitive.log"
+
+    mkdir -p "$OUTPUT_DIR"
+
+    if [ ! -f "$GATK_BIN" ]; then
+        echo "[ERROR] GATK not found at $GATK_BIN"
+        exit 1
+    fi
+
+    echo "[INFO] Running GATK HaplotypeCaller with relaxed discovery thresholds..."
+    echo "[INFO] Output: $OUTPUT_DIR"
+    echo "[INFO] Log: $LOG_FILE"
+
+    # Relaxed parameters for sensitive variant discovery:
+    # --standard-min-confidence-threshold-for-calling: Lower confidence threshold (default 10)
+    # --min-pruning: Reduce aggressive pruning of haplotypes
+    # --disable-read-filter: Include reads that would normally be filtered
+    # Use quality-preprocessed BAM to avoid WellformedReadFilter rejection
+    echo "[INFO] Using quality-preprocessed BAM: $BAM_QUAL"
+    PATH="$GATK_ENV_BIN:$PATH" "$GATK_BIN" HaplotypeCaller \
+        -R "$REFERENCE" \
+        -I "$BAM_QUAL" \
+        -O "$OUTPUT_DIR/variants_raw.vcf.gz" \
+        -L "$TRUTH_BED" \
+        --standard-min-confidence-threshold-for-calling 0 \
+        --min-pruning 1 \
+        --min-base-quality-score 3 \
+        --native-pair-hmm-threads 8 \
+        --disable-read-filter NotDuplicateReadFilter \
+        --disable-read-filter MappingQualityReadFilter \
+        2>&1 | tee "$LOG_FILE"
+
+    echo "[STEP] Normalizing..." | tee -a "$LOG_FILE"
+    "$BCFTOOLS_BIN" norm -f "$REFERENCE" -m -any \
+        "$OUTPUT_DIR/variants_raw.vcf.gz" | \
+        "$BCFTOOLS_BIN" sort -Oz -o "$OUTPUT_DIR/variants.vcf.gz"
+    "$BCFTOOLS_BIN" index -t "$OUTPUT_DIR/variants.vcf.gz"
+
+    echo "[SUCCESS] HaplotypeCaller (Sensitive) analysis complete"
     echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
 }
 
@@ -138,6 +196,8 @@ run_deepvariant() {
     echo "[INFO] Container: $DV_SIF"
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
+    echo "[INFO] Using quality-preprocessed BAM: $BAM_QUAL"
+    echo "Running DeepVariant on ENTIRE BAM (no region restriction)..."
 
     "$SINGULARITY_BIN" exec \
         --bind /data:/data \
@@ -146,8 +206,7 @@ run_deepvariant() {
         /opt/deepvariant/bin/run_deepvariant \
             --model_type=PACBIO \
             --ref="$REFERENCE" \
-            --reads="$BAM" \
-            --regions="$TRUTH_BED" \
+            --reads="$BAM_QUAL" \
             --output_vcf="$OUTPUT_DIR/variants.vcf.gz" \
             --num_shards=8 \
             2>&1 | tee "$LOG_FILE"
@@ -173,13 +232,6 @@ run_clair3_rna() {
 
     mkdir -p "$OUTPUT_DIR"
 
-    if [ ! -d "$CLAIR3_MODEL" ]; then
-        echo "[ERROR] Clair3 model directory not found at $CLAIR3_MODEL"
-        echo "[INFO] Run: bash scripts/setup_envs.sh clair3"
-        echo "[INFO] Or download from: https://github.com/HKU-BAL/Clair3#pre-trained-models"
-        exit 1
-    fi
-
     # Determine runtime: Singularity (Linux) or Docker (macOS)
     if [ -f "$CLAIR3_SIF" ] && command -v singularity &>/dev/null; then
         echo "[INFO] Using Singularity container: $CLAIR3_SIF"
@@ -188,7 +240,7 @@ run_clair3_rna() {
                 --bind /data:/data \
                 --bind "$WORKDIR:$WORKDIR" \
                 "$CLAIR3_SIF" \
-                /usr/local/bin/run_clair3.sh "$@"
+                /opt/bin/run_clair3.sh "$@"
         }
     elif command -v docker &>/dev/null; then
         echo "[INFO] Using Docker image: $CLAIR3_DOCKER_IMAGE"
@@ -197,7 +249,7 @@ run_clair3_rna() {
                 -v /data:/data \
                 -v "$WORKDIR:$WORKDIR" \
                 "$CLAIR3_DOCKER_IMAGE" \
-                run_clair3.sh "$@"
+                /opt/bin/run_clair3.sh "$@"
         }
     else
         echo "[ERROR] Neither Singularity nor Docker found. Install one to run Clair3."
@@ -209,21 +261,38 @@ run_clair3_rna() {
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    _CLAIR3_RUN \
-        --bam_fn="$BAM" \
-        --ref_fn="$REFERENCE" \
-        --threads=16 \
-        --platform="hifi" \
-        --model_path="$CLAIR3_MODEL" \
-        --output="$OUTPUT_DIR" \
-        --bed_fn="$TRUTH_BED" \
-        --include_all_ctgs \
-        --no_phasing_for_fa \
-        --haploid_sensitive \
-        2>&1 | tee "$LOG_FILE"
+    # run_clair3.sh handles both pileup and full-alignment stages per chromosome
+    for CTGNAME in chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 \
+                   chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 \
+                   chr21 chr22 chrX chrY chrM; do
+        echo "[INFO] Calling variants on $CTGNAME..."
+        _CLAIR3_RUN \
+            --bam_fn="$BAM_QUAL" \
+            --ref_fn="$REFERENCE" \
+            --threads=16 \
+            --platform="hifi" \
+            --model_path="/opt/models/hifi" \
+            --ctg_name="$CTGNAME" \
+            --sample_name="sample" \
+            --min_mq=5 \
+            --snp_min_af=0.05 \
+            --indel_min_af=0.05 \
+            --output="$OUTPUT_DIR/${CTGNAME}" \
+            2>&1 | tee -a "$LOG_FILE"
+    done
+
+    # Merge per-chromosome VCFs (run_clair3.sh outputs merge_output.vcf.gz per chrom dir)
+    echo "[INFO] Merging VCFs..."
+    "$BCFTOOLS_BIN" concat -o "$OUTPUT_DIR/variants.vcf.gz" -O z \
+        $(for c in chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 \
+                   chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 \
+                   chr21 chr22 chrX chrY chrM; do
+              echo "$OUTPUT_DIR/${c}/merge_output.vcf.gz"
+          done) 2>&1 | tee -a "$LOG_FILE"
+    "$BCFTOOLS_BIN" index -t "$OUTPUT_DIR/variants.vcf.gz" 2>&1 | tee -a "$LOG_FILE"
 
     echo "[SUCCESS] Clair3-RNA analysis complete"
-    echo "[INFO] Output: $OUTPUT_DIR/merge_output.vcf.gz"
+    echo "[INFO] Output: $OUTPUT_DIR/variants.vcf.gz"
 }
 
 # ============================================================================
@@ -248,7 +317,7 @@ run_longcallr() {
                 --bind /data:/data \
                 --bind "$WORKDIR:$WORKDIR" \
                 "$LONGCALLR_SIF" \
-                longcallr "$@"
+                longcallR "$@"
         }
     elif command -v docker &>/dev/null; then
         echo "[INFO] Using Docker image: $LONGCALLR_DOCKER_IMAGE"
@@ -273,15 +342,11 @@ run_longcallr() {
     echo "[INFO] Output: $OUTPUT_DIR"
     echo "[INFO] Log: $LOG_FILE"
 
-    # Chromosomes containing truth variants
-    CONTIGS="chr11 chr17 chr18 chr19 chr20 chr21 chrX"
-
     _LONGCALLR_RUN \
-        --bam-path "$BAM" \
+        --bam-path "$BAM_QUAL" \
         --ref-path "$REFERENCE" \
         --output "$OUTPUT_DIR/variants" \
         --preset hifi-isoseq \
-        --contigs $CONTIGS \
         --threads 16 \
         --min-allele-freq 0.05 \
         --low-allele-frac-cutoff 0.03 \
@@ -305,6 +370,9 @@ run_longcallr() {
 case "$CALLER" in
     haplotypecaller|gatk)
         run_haplotypecaller
+        ;;
+    haplotypecaller_sensitive|gatk_sensitive)
+        run_haplotypecaller_sensitive
         ;;
     deepvariant)
         run_deepvariant
