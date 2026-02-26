@@ -1,507 +1,278 @@
-# RNA-seq Variant Caller Comparison Pipeline
+# RNA-seq Somatic Variant Calling Pipeline
 
-Comprehensive comparison of four variant calling approaches for detecting somatic mutations in hematologic malignancies using PacBio Iso-Seq single-cell RNA-seq data.
+Detection of somatic mutations in hematologic malignancies using PacBio Iso-Seq (KINNEX) single-cell RNA-seq data. The pipeline runs four independent variant callers, annotates against population databases via VEP, and applies a multi-caller concordance filter to isolate high-confidence somatic candidates.
+
+---
+
+## Sample
+
+| Field | Value |
+|---|---|
+| Sample | 5801-diagnosis |
+| Data type | PacBio Iso-Seq / KINNEX scRNA-seq |
+| BAM | `/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam` |
+| Quality-fixed BAM | `scisoseq_synthetic_qual.bam` (synthetic Q30, required by GATK) |
+| Reference | `reference/genome.fa` → GRCh38 from 10x Genomics Space Ranger |
+
+---
+
+## Truth Set (8 Known Somatic Variants)
+
+| Gene | Position (GRCh38) | Mutation | VAF |
+|---|---|---|---|
+| SRSF2 | chr17:76736877 | p.Pro95Arg (missense) | 37% |
+| SETBP1 | chr18:44951948 | missense | 28% |
+| RUNX1 | chr21:34799432 | nonsense | 35% |
+| ASXL1 | chr20:32434638 | frameshift | 8% |
+| CBL | chr11:119242488 | frameshift | UNK |
+| MEF2B | chr19:19145882 | missense | UNK |
+| BCOR | chrX:40057210 | nonsense | UNK |
+| PHF6 | chrX:134415107 | missense | UNK |
+
+> **Note — CBL**: This variant is in a 177 kb intron. Iso-Seq reads skip intronic sequence (CIGAR `N` operations), making it fundamentally undetectable by RNA-seq. This is a data limitation, not a caller bug.
+
+---
+
+## Pipeline Overview
+
+```
+BAM (scisoseq_synthetic_qual.bam)
+        │
+        ├─► GATK HaplotypeCaller  ─┐
+        ├─► DeepVariant (PACBIO)  ─┤
+        ├─► Clair3-RNA (hifi)     ─┤── VEP annotation ──► classify_variants.py
+        └─► LongcallR (hifi-isoseq)┘         │
+                                              ▼
+                                    somatic_known / novel_candidates /
+                                    rare_candidates / uncertain / germline
+                                              │
+                                    merge_callers.py (≥2 caller concordance)
+                                              │
+                                    mosdepth BAM depth filter (BAM_DP > 1500)
+                                              │
+                                    high_confidence_bamdp1500.vcf.gz  ◄── final output
+```
+
+---
 
 ## Quick Start
 
 ```bash
-# Run all variant callers
 cd /data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall
-./scripts/run_callers.sh all
 
-# Run individual callers
-./scripts/run_callers.sh lab_supervised      # 1-2 hours
-./scripts/run_callers.sh lab_unsupervised    # 30 min (chr21)
-./scripts/run_callers.sh gatk                # 30-60 min
-./scripts/run_callers.sh deepvariant         # 1-2 hours
+# Step 1: Run all 4 callers (full genome)
+bash scripts/run_callers.sh all
 
-# Evaluate results
-python scripts/evaluate_callers.py
+# Step 2: Annotate each caller's VCF with VEP + gnomAD + COSMIC
+bash scripts/annotate_and_filter.sh results/haplotypecaller/variants_raw.vcf     gatk
+bash scripts/annotate_and_filter.sh results/deepvariant/variants.vcf.gz          deepvariant
+bash scripts/annotate_and_filter.sh results/clair3_rna/variants.vcf.gz           clair3
+bash scripts/annotate_and_filter.sh results/longcallr/variants.vcf.gz            longcallr
 
-# Generate report
-python scripts/generate_report.py
+# Step 3: Classify variants (runs automatically inside Step 2, but can be re-run)
+python scripts/classify_variants.py \
+    --input annotation/gatk/annotated.vcf.gz \
+    --output annotation/gatk --sample gatk
+
+# Step 4: Multi-caller concordance merge
+python scripts/merge_callers.py
+
+# Step 5: Apply raw BAM depth filter (BAM_DP > 1500) using mosdepth
+#         (see Filtering section below for the full script)
 ```
 
 ---
 
-## Overview
+## Variant Callers
 
-### What This Pipeline Does
+| Caller | Container / Env | Model | SNPs | Indels | Full-genome output |
+|---|---|---|---|---|---|
+| GATK HaplotypeCaller | `gatk-env` conda | RNA-seq | ✓ | ✓ | `results/haplotypecaller/variants_raw.vcf` |
+| DeepVariant | `containers/deepvariant_1.6.1.sif` | PACBIO | ✓ | ✓ | `results/deepvariant/variants.vcf.gz` |
+| Clair3-RNA | `containers/clair3_latest.sif` | hifi (per-chrom) | ✓ | ✓ | `results/clair3_rna/variants.vcf.gz` |
+| LongcallR | `containers/longcallr_latest.sif` | hifi-isoseq | ✓ | ✗ | `results/longcallr/variants.vcf.gz` |
 
-Compares four variant calling methods on a truth set of 8 known cancer-associated variants:
+### Full-genome variant counts
 
-| Caller | Type | Focus | Language | Runtime |
-|--------|------|-------|----------|---------|
-| **Lab Scripts (Supervised)** | Targeted | Known mutations + cell-level genotyping | Python | 1-2h |
-| **Lab Scripts (Unsupervised)** | Discovery | De novo SNV discovery | Python | 30min-8h |
-| **GATK HaplotypeCaller** | Standard | Industry-standard RNA-seq variant calling | Java | 30-60min |
-| **DeepVariant** | ML-based | Deep learning variant predictions | Singularity | 1-2h |
+| Caller | Total | SNPs | Indels | Ts/Tv |
+|---|---|---|---|---|
+| GATK | 1,619,585 | 1,100,978 | 482,378 | 3.05 |
+| DeepVariant | 2,449,434 | ~2.2M | ~250K | 3.53 |
+| Clair3-RNA | 3,611,894 | 3,334,002 | 279,377 | — |
+| LongcallR | 441,710 | 441,710 | 0 | 3.92 |
 
-### Truth Set (8 Variants)
-
-Located in: `truth_set/truth_set.vcf.gz`
-
-| Gene | Position | Type | VAF |
-|------|----------|------|-----|
-| RUNX1 | chr21:34799432 | Nonsense | 35% |
-| ASXL1 | chr20:32434638 | Frameshift | 8% |
-| SETBP1 | chr18:44951948 | Missense | 28% |
-| SRSF2 | chr17:76736877 | Missense | 37% |
-| CBL | chr11:119242488 | Frameshift | UNK |
-| MEF2B | chr19:19145882 | Missense | UNK |
-| BCOR | chrX:40057210 | Nonsense | UNK |
-| PHF6 | chrX:134415107 | Missense | UNK |
-
-### Input Data
-
-- **BAM**: `/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam` (11GB, indexed)
-- **Reference**: `/data/salomonis-archive/genomes/hg38/genome.fa` (3GB)
-- **Target regions**: `truth_set/truth_regions.bed` (±1kb around variants)
-
-### Expected Outputs
-
-```
-results/
-├── supervised_extraction/          # Lab supervised results
-│   ├── 5801-diagnosis_complete_analysis.tsv
-│   ├── 5801-diagnosis_mutation_matrix.csv
-│   └── lab_supervised.vcf.gz
-├── global_snv/                     # Lab unsupervised results
-│   ├── chr21_output.txt
-│   └── lab_unsupervised.vcf.gz
-├── gatk/                           # GATK results
-│   ├── variants_raw.vcf.gz
-│   ├── variants_filtered.vcf.gz
-│   └── variants_normalized.vcf.gz
-├── deepvariant/                    # DeepVariant results
-│   ├── variants.vcf.gz
-│   ├── variants.g.vcf.gz
-│   └── variants_normalized.vcf.gz
-└── comparison/                     # Evaluation results
-    ├── summary.json
-    ├── comparison.csv
-    └── COMPARISON_REPORT.md
-```
+> **LongcallR** is SNP-only by design. It cannot call indels.
 
 ---
 
-## Detailed Usage
+## VEP Annotation
 
-### Phase 1: Environment Setup ✓
+VEP (Ensembl v112, GRCh38) is run via Singularity:
 
-**Status**: COMPLETE
-
-Required tools:
-- ✓ samtools (installed)
-- ✓ GATK 4.x (installed)
-- ⏳ bcftools 1.23 (installing)
-- ✓ Reference genome (3GB, ready)
-- ✓ Test BAM (11GB, indexed, ready)
-
-### Phase 2: Truth Set Preparation ✓
-
-**Status**: COMPLETE
-
-Truth set files created:
-- `truth_set/truth_set.vcf` - Uncompressed VCF with 8 variants
-- `truth_set/truth_set.vcf.gz` - Compressed VCF
-- `truth_set/truth_regions.bed` - Target regions (±1kb)
-- `truth_set/test_variants_formatted.txt` - Lab script format
-
-### Phase 3: Run Variant Callers
-
-#### 3.1 Lab Supervised (variant_extraction.py)
-
-```bash
-./scripts/run_callers.sh lab_supervised
+```
+containers/ensembl-vep_release_112.0.sif
+vep_cache/homo_sapiens/112_GRCh38/   (1.1 GB)
 ```
 
-**What it does**:
-- Searches for specified mutations in BAM file
-- Extracts read-level details per cell barcode
-- Creates mutation × cell matrix
-- Outputs: complete_analysis.tsv, mutation_matrix.csv
+**Databases annotated per variant:**
+- gnomAD exomes (r2.1.1) and genomes (v3.1.2) — 14 population AFs
+- dbSNP 156 — rsIDs
+- COSMIC 98 — somatic mutation IDs (COSV/COSM)
+- ClinVar (Oct 2023) — clinical significance
+- SIFT / PolyPhen — protein function predictions
+- HGVS notation (HGVSc, HGVSp)
+- Consequence, gene symbol, canonical transcript, MANE Select
 
-**Runtime**: 1-2 hours
-**Output**: `results/supervised_extraction/`
-
-**Manual run** (if needed):
-```bash
-python /data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/variant_extraction.py \
-  --sample 5801-diagnosis \
-  --bam /data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-  --mutations truth_set/test_variants_formatted.txt \
-  --reference /data/salomonis-archive/genomes/hg38/genome.fa \
-  --output-dir results/supervised_extraction
-```
-
-#### 3.2 Lab Unsupervised (global_snv.py)
-
-```bash
-./scripts/run_callers.sh lab_unsupervised
-```
-
-**What it does**:
-- De novo SNV discovery (no prior knowledge)
-- Filters paralogs automatically
-- Reports frequency distributions
-- **Note**: SNVs only, misses frameshifts
-
-**Runtime**:
-- Chr21 test: 10-30 min
-- Full genome: 4-8 hours
-
-**Output**: `results/global_snv/`
-
-**To run full genome** (after chr21 test):
-```bash
-python /data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/global_snv.py \
-  /data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-  /data/salomonis-archive/genomes/hg38/genome.fa \
-  results/global_snv/genome_output.txt \
-  --min_reads 50 \
-  --min_percent 8.0
-```
-
-#### 3.3 GATK HaplotypeCaller
-
-```bash
-./scripts/run_callers.sh gatk
-```
-
-**What it does**:
-- Standard GATK RNA-seq variant calling
-- Calls both SNVs and indels
-- Applies quality filters
-
-**Runtime**: 30-60 minutes
-**Output**: `results/gatk/variants_filtered.vcf.gz`
-
-**Manual run** (if needed):
-```bash
-# Step 1: Call variants
-gatk HaplotypeCaller \
-  -R /data/salomonis-archive/genomes/hg38/genome.fa \
-  -I /data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-  -O results/gatk/variants_raw.vcf.gz \
-  --dont-use-soft-clipped-bases \
-  --standard-min-confidence-threshold-for-calling 20.0 \
-  --min-base-quality-score 10 \
-  -L truth_set/truth_regions.bed \
-  --native-pair-hmm-threads 8
-
-# Step 2: Filter
-gatk VariantFiltration \
-  -R /data/salomonis-archive/genomes/hg38/genome.fa \
-  -V results/gatk/variants_raw.vcf.gz \
-  -O results/gatk/variants_filtered.vcf.gz \
-  --filter-name "LowQual" --filter-expression "QUAL < 30.0" \
-  --filter-name "LowDepth" --filter-expression "DP < 10"
-```
-
-#### 3.4 DeepVariant
-
-```bash
-./scripts/run_callers.sh deepvariant
-```
-
-**What it does**:
-- Deep learning-based variant calling
-- Uses WGS model (no RNA-seq specific model)
-- Generates both VCF and gVCF
-
-**Runtime**: 1-2 hours
-**Output**: `results/deepvariant/variants.vcf.gz`
-
-**First-time setup** (downloads container):
-- Container auto-downloads on first run
-- Downloads to: `containers/deepvariant_1.6.1.sif`
-- Size: ~2GB
-
-**Manual run** (if needed):
-```bash
-singularity exec \
-  --bind /data:/data \
-  containers/deepvariant_1.6.1.sif \
-  /opt/deepvariant/bin/run_deepvariant \
-    --model_type=WGS \
-    --ref=/data/salomonis-archive/genomes/hg38/genome.fa \
-    --reads=/data/salomonis-archive/BAMs/Grimes/scRNA-Seq/KINNEX/5801-diagnosis/scisoseq.mapped.bam \
-    --regions=truth_set/truth_regions.bed \
-    --output_vcf=results/deepvariant/variants.vcf.gz \
-    --output_gvcf=results/deepvariant/variants.g.vcf.gz \
-    --num_shards=8 \
-    --make_examples_extra_args="min_mapping_quality=1"
-```
-
-### Phase 4: Evaluate Results
-
-```bash
-python scripts/evaluate_callers.py
-```
-
-**What it does**:
-- Loads truth VCF and all caller VCFs
-- Matches variants (exact for SNVs, fuzzy for indels)
-- Calculates sensitivity, precision, F1
-- Measures VAF accuracy (correlation, MAE)
-- Outputs JSON and CSV summaries
-
-**Output Files**:
-- `results/comparison/summary.json` - Full metrics in JSON
-- `results/comparison/comparison.csv` - Comparison table
-
-**Output Example**:
-```
-Caller              TP FP FN Sensitivity Precision F1    VAF_Corr VAF_MAE
-Lab_Supervised     8  0  0   1.000       1.000    1.000 0.988    0.025
-Lab_Unsupervised   6  0  2   0.750       1.000    0.857 0.992    0.012
-GATK               7  1  1   0.875       0.875    0.875 0.876    0.035
-DeepVariant        6  2  2   0.750       0.750    0.750 0.765    0.048
-```
-
-### Phase 5: Generate Report
-
-```bash
-python scripts/generate_report.py
-```
-
-**Output**: `results/comparison/COMPARISON_REPORT.md`
-
-**Report includes**:
-- Executive summary
-- Caller strengths/weaknesses
-- Detailed performance metrics
-- Technical considerations
-- Production recommendations
-- Appendix with software versions
+Output per caller: `annotation/{caller}/annotated.vcf.gz`
 
 ---
 
-## Advanced Usage
+## Variant Classification
 
-### Run Only Specific Chromosomes
+`scripts/classify_variants.py` reads each annotated VCF and assigns one of five tiers:
 
-**Lab Supervised** (by modifying mutation file):
-```bash
-# Edit truth_set/test_variants_formatted.txt to include only chr21
-python /data/salomonis-archive/LabFiles/Nathan/Revio/altanalyze3/altanalyze3/components/bam/variant_extraction.py ...
+| Class | Criteria | Action |
+|---|---|---|
+| **GERMLINE** | gnomAD AF ≥ 0.001 **or** ALT reads < 5 | Excluded from somatic analysis |
+| **SOMATIC_KNOWN** | COSMIC match (any gnomAD AF) **or** ClinVar pathogenic + gnomAD AF < 0.001 | High-priority candidate |
+| **NOVEL_CANDIDATE** | gnomAD AF = 0, QUAL ≥ 30, ALT reads ≥ 5 | Candidate — absent from population |
+| **RARE_CANDIDATE** | gnomAD AF < 0.0001, ALT reads ≥ 5 | Candidate — very rare in population |
+| **UNCERTAIN** | gnomAD AF 0.0001–0.001, ALT reads ≥ 5 | Grey zone — rare but present in population |
+
+**Decision priority**: SOMATIC_KNOWN > gnomAD filter > NOVEL > RARE > UNCERTAIN
+
+**Key thresholds:**
+- `GERMLINE_AF = 0.001` — variants above this frequency in any gnomAD population are excluded
+- `MIN_ALT_DEPTH = 5` — minimum ALT-supporting reads (uses FORMAT/AD; falls back to DP×AF for LongcallR)
+- `MIN_QUAL = 30` — minimum QUAL score for NOVEL_CANDIDATE
+
+Classification outputs per caller:
+```
+annotation/{caller}/
+├── annotated.vcf.gz          # VEP-annotated input
+├── somatic_known.vcf.gz
+├── novel_candidates.vcf.gz
+├── rare_candidates.vcf.gz
+├── uncertain.vcf.gz
+└── germline.vcf.gz           # excluded
 ```
 
-**Lab Unsupervised** (already has --test_chromosome):
-```bash
-python /path/to/global_snv.py \
-  scisoseq.mapped.bam genome.fa output.txt \
-  --test_chromosome chr21
-```
+### Classification summary (post-filter)
 
-### Custom Filtering Parameters
-
-**Lab Unsupervised**:
-```bash
-# More stringent
---min_reads 100 --min_percent 15.0
-
-# More sensitive
---min_reads 5 --min_percent 2.0
-```
-
-**GATK**:
-```bash
-# Higher quality threshold
---standard-min-confidence-threshold-for-calling 30.0
-
-# More base pairs (removes low quality)
---min-base-quality-score 20
-```
-
-### Manual VCF Normalization
-
-If bcftools is available:
-```bash
-# Sort
-bcftools sort -Oz variants.vcf.gz > sorted.vcf.gz
-
-# Normalize (left-align indels)
-bcftools norm -f genome.fa normalized.vcf.gz > final.vcf.gz
-
-# Index
-bcftools index -t final.vcf.gz
-```
-
-### Inspect Specific Variant
-
-```bash
-# Check if variant was found by each caller
-for vcf in results/*/variants*.vcf.gz; do
-  echo "=== $vcf ==="
-  zcat $vcf | grep "chr21" | grep "34799432"
-done
-
-# Manual inspection with samtools
-samtools view -b scisoseq.mapped.bam chr21:34799430-34799435 | samtools tview - genome.fa
-```
+| Class | GATK | DeepVariant | Clair3 | LongcallR |
+|---|---|---|---|---|
+| GERMLINE | 85.4% | 89.9% | 91.6% | 73.1% |
+| NOVEL_CANDIDATE | 7.6% | 0.1% | 0.2% | 16.8% |
+| SOMATIC_KNOWN | 3.1% | 1.9% | 1.6% | 3.9% |
+| UNCERTAIN | 2.4% | 0.9% | 0.6% | 1.5% |
+| RARE_CANDIDATE | 1.5% | 7.2% | 6.0% | 4.7% |
 
 ---
 
-## Troubleshooting
+## Multi-Caller Concordance Merge
 
-### bcftools Installation Hangs
+`scripts/merge_callers.py` merges all four callers' somatic buckets (excluding germline) and counts how many independent callers support each variant site:
 
-**Solution**: Install in separate environment
 ```bash
-conda create -n bcftools-env -c bioconda bcftools=1.23 -y
-conda activate bcftools-env
-# Then use bcftools commands
+python scripts/merge_callers.py \
+    [--callers gatk deepvariant clair3 longcallr] \
+    [--annotation_dir annotation/] \
+    [--output results/merged/]
 ```
 
-### GATK Out of Memory
+**Output tiers:**
 
-**Solution**: Increase memory allocation
+| File | Variants | Criterion |
+|---|---|---|
+| `high_confidence.vcf.gz` | 66,280 | ≥ 3 callers agree |
+| `medium_confidence.vcf.gz` | 118,114 | 2 callers agree |
+| `low_confidence.vcf.gz` | 332,620 | 1 caller only (likely noise) |
+| `all_candidates.vcf.gz` | 517,014 | All, tagged with `CALLER_COUNT` and `CALLERS` |
+
+All output VCFs carry the full VEP `CSQ` annotation, `SOMATIC_CLASS`, `SOMATIC_REASON`, `CALLER_COUNT`, and `CALLERS` INFO fields.
+
+---
+
+## Depth Filtering — Critical Note for PacBio RNA-seq
+
+### Problem: GATK FORMAT/DP severely underestimates true depth
+
+GATK excludes reads with MQ=255 (PacBio's "mapping quality not computed" flag for splice-junction-spanning reads) and soft-clipped bases (`--dont-use-soft-clipped-bases`). This means GATK's `FORMAT/DP` typically reflects only **2–5% of actual BAM reads**.
+
+**Example — SRSF2 (chr17:76736877):**
+
+| Source | Depth |
+|---|---|
+| Raw BAM (mosdepth) | 5,548 |
+| GATK FORMAT/DP | 162 (2.9%) |
+| GATK AD (REF,ALT) | 88, 74 |
+
+Filtering on `FORMAT/DP > 1500` would incorrectly discard SRSF2.
+
+### Solution: Use mosdepth for true BAM depth
+
+`mosdepth` counts all reads in the BAM without GATK's internal filters. The pipeline annotates each variant with `INFO/BAM_DP` from mosdepth and filters on that:
+
 ```bash
-export _JAVA_OPTIONS="-Xmx16g"
-gatk HaplotypeCaller ...
+MOSDEPTH=/usr/local/anaconda3-2020/envs/mosdepth/bin/mosdepth
+
+# Run mosdepth over variant positions
+$MOSDEPTH --by positions.bed --no-per-base --threads 8 \
+    tmp/mosdepth_out scisoseq_synthetic_qual.bam
+
+# Annotate VCF with BAM_DP and filter
+bcftools annotate -a bam_depth.tsv.gz -c CHROM,POS,INFO/BAM_DP ...
+bcftools filter -i 'INFO/BAM_DP > 1500' ...
 ```
 
-### DeepVariant Container Download Fails
+### Final filtered output files (BAM_DP > 1500)
 
-**Solution**: Manual download
-```bash
-cd containers/
-singularity pull docker://google/deepvariant:1.6.1
-# Wait for ~5-10 minutes, 2GB download
-```
-
-### Lab Script Import Errors
-
-**Issue**: Missing dependencies in altanalyze3
-
-**Solution**: Check Python environment
-```bash
-python -c "import pysam; import HTSeq; print('OK')"
-```
-
-### Low Variant Detection
-
-**Possible causes**:
-1. MAPQ filter too stringent (43% of reads are MAPQ=0)
-2. VAF threshold too high
-3. Depth too low in regions
-
-**Solution**: Lower thresholds
-- `--min-mapping-quality=1` for DeepVariant
-- `--min-base-quality-score 10` for GATK
-- `--min_percent 5.0` for lab_unsupervised
+| File | Variants | SNPs | Indels | Description |
+|---|---|---|---|---|
+| `annotation/gatk/non_germline_bamdp1500.vcf.gz` | 1,351 | 1,056 | 295 | All GATK non-germline, raw depth > 1500 |
+| `results/merged/high_confidence_bamdp1500.vcf.gz` | **983** | 968 | 15 | ≥3 callers, raw depth > 1500 — **primary output** |
+| `results/merged/medium_confidence_bamdp1500.vcf.gz` | 289 | 246 | 43 | 2 callers, raw depth > 1500 |
+| `results/merged/low_confidence_bamdp1500.vcf.gz` | 609 | 224 | 387 | 1 caller, raw depth > 1500 |
 
 ---
 
-## Timing Guide
+## Key Scripts
 
-| Phase | Component | Runtime | Total |
-|-------|-----------|---------|-------|
-| 1 | Setup | instant | instant |
-| 2 | Truth prep | ~5 min | 5 min |
-| 3 | Lab supervised | 1-2 hours | 1-2 hours |
-| 3 | Lab unsupervised (chr21) | 30 min | 30 min |
-| 3 | Lab unsupervised (full) | 4-8 hours | 4-8 hours |
-| 3 | GATK | 30-60 min | 30-60 min |
-| 3 | DeepVariant | 1-2 hours | 1-2 hours |
-| 4 | Evaluation | ~10 min | 10 min |
-| 5 | Report | ~5 min | 5 min |
-| **Total (targeted)** | **All except full unsupervised** | | **~4 hours** |
-| **Total (comprehensive)** | **Include full unsupervised** | | **~10 hours** |
+| Script | Purpose |
+|---|---|
+| `scripts/run_callers.sh` | Run all 4 variant callers (full genome) |
+| `scripts/annotate_and_filter.sh` | VEP annotation → somatic classification |
+| `scripts/classify_variants.py` | Tiered somatic classification with gnomAD + COSMIC |
+| `scripts/merge_callers.py` | Multi-caller concordance merge → confidence tiers |
 
 ---
 
-## Key Files
+## Key Biological Caveats
 
-```
-/data/salomonis-archive/FASTQs/NCI-R01/rna_seq_varcall/
-├── README.md (this file)
-├── CLAUDE.md (project instructions)
-├── IMPLEMENTATION_STATUS.md (detailed status)
-├── test_variants.txt (original truth variants)
-├── scripts/
-│   ├── run_callers.sh (main runner)
-│   ├── prepare_truth_vcf.py (created truth VCF)
-│   ├── tsv_to_vcf.py (convert lab outputs)
-│   ├── evaluate_callers.py (evaluation)
-│   ├── generate_report.py (reporting)
-│   └── compress_vcf.py (VCF compression)
-├── truth_set/
-│   ├── truth_set.vcf (8 variants)
-│   ├── truth_set.vcf.gz (compressed)
-│   ├── truth_regions.bed (target regions)
-│   └── test_variants_formatted.txt (lab format)
-└── results/
-    ├── supervised_extraction/ (lab supervised)
-    ├── global_snv/ (lab unsupervised)
-    ├── gatk/ (GATK results)
-    ├── deepvariant/ (DeepVariant results)
-    └── comparison/ (evaluation results)
-```
+1. **No matched normal**: Without paired germline DNA, rare germline variants are indistinguishable from somatic mutations by population frequency alone. COSMIC and ClinVar annotations are the primary evidence for somatic origin.
+
+2. **RNA editing (A→I)**: ADAR-mediated RNA editing produces A>G variants that appear as real mutations. A future filter using REDIportal (~4.5M known editing sites) would reduce this noise.
+
+3. **Intronic variants undetectable**: Iso-Seq reads skip introns entirely (CIGAR `N`). Any mutation in an intron (e.g., CBL chr11:119242488 in a 177 kb intron) cannot be detected from RNA-seq data regardless of caller or depth.
+
+4. **UNCERTAIN bucket**: The 116 GATK variants (9 in high-confidence) with gnomAD AF 0.01–0.1% are included but represent a grey zone between rare germline and somatic.
 
 ---
 
-## Dependencies
+## Software Versions
 
-**Required**:
-- Python 3.x with pysam, scipy
-- samtools
-- GATK 4.x
-- Reference genome (3GB)
-- Test BAM (11GB, indexed)
-
-**Optional**:
-- bcftools (for VCF operations)
-- Singularity (for DeepVariant)
-- IGV (for manual inspection)
-
----
-
-## Output Metrics Explained
-
-### Sensitivity (Recall)
-- **Formula**: TP / (TP + FN)
-- **Meaning**: Of the 8 true variants, how many did the caller find?
-- **Range**: 0-1 (higher is better)
-- **Example**: 0.875 = found 7 of 8 variants
-
-### Precision
-- **Formula**: TP / (TP + FP)
-- **Meaning**: Of the variants called, how many are true?
-- **Range**: 0-1 (higher is better)
-- **Example**: 0.875 = 7 correct, 1 false positive
-
-### F1 Score
-- **Formula**: 2 × (Precision × Sensitivity) / (Precision + Sensitivity)
-- **Meaning**: Harmonic mean of precision and sensitivity
-- **Range**: 0-1 (higher is better)
-- **Use**: Balanced metric when both precision and recall matter
-
-### VAF Correlation
-- **Formula**: Pearson correlation coefficient
-- **Meaning**: How well does called VAF match expected VAF?
-- **Range**: -1 to 1 (higher is better)
-- **Example**: 0.95 = excellent correlation
-
-### VAF MAE (Mean Absolute Error)
-- **Formula**: Average absolute difference between expected and called VAF
-- **Meaning**: Average deviation in VAF quantification
-- **Range**: 0 to 1 (lower is better)
-- **Example**: 0.025 = average error of 2.5% VAF
+| Tool | Version | Location |
+|---|---|---|
+| samtools | 1.23 | `bio-cli` conda env |
+| bcftools | 1.23 | `bio-cli` conda env |
+| GATK | 4.6.2.0 | `gatk-env` conda env |
+| DeepVariant | 1.6.1 | `containers/deepvariant_1.6.1.sif` |
+| Clair3 | latest | `containers/clair3_latest.sif` |
+| LongcallR | latest | `containers/longcallr_latest.sif` |
+| VEP | 112.0 | `containers/ensembl-vep_release_112.0.sif` |
+| mosdepth | 0.3.3 | `mosdepth` conda env |
+| Singularity | — | `bio-cli` conda env |
 
 ---
 
-## Contact & Support
-
-For issues with:
-- **Lab scripts**: Contact Nathan (Lab Files owner)
-- **GATK**: See Broad Institute documentation
-- **DeepVariant**: See Google DeepVariant documentation
-- **This pipeline**: Check IMPLEMENTATION_STATUS.md
-
----
-
-**Last Updated**: 2026-02-13
-**Status**: Ready for execution
+**Last updated**: 2026-02-26
