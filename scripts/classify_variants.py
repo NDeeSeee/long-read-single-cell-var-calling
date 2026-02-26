@@ -97,8 +97,9 @@ def is_somatic_known(csq_entries, fields, existing_var):
 
 def classify_variant(qual, gnomad_af, somatic, somatic_source, alt_depth=0):
     """Apply tiered decision logic."""
-    # Low-support calls are unreliable regardless of annotation
-    if alt_depth < MIN_ALT_DEPTH:
+    # Low-support calls are unreliable regardless of annotation.
+    # alt_depth == -1 means no depth field present — skip filter.
+    if alt_depth != -1 and alt_depth < MIN_ALT_DEPTH:
         return "GERMLINE", f"low_depth_AD={alt_depth}"
     if somatic:
         # COSMIC always overrides gnomAD — somatic mutations don't appear in population DBs
@@ -117,23 +118,44 @@ def classify_variant(qual, gnomad_af, somatic, somatic_source, alt_depth=0):
 
 
 def get_alt_depth(cols):
-    """Parse ALT allele depth from FORMAT AD field. Returns 0 if not present."""
+    """
+    Parse ALT allele depth from FORMAT fields.
+    Priority:
+      1. AD field (REF,ALT counts) — GATK, DeepVariant, Clair3
+      2. DP * AF                   — LongcallR (GT:GQ:PS:DP:AF:PQ)
+    Returns -1 if no depth info is available (depth filter skipped).
+    """
     if len(cols) < 10:
-        return 0
-    fmt = cols[8].split(':')
+        return -1
+    fmt    = cols[8].split(':')
     sample = cols[9].split(':')
-    if 'AD' not in fmt:
-        return 0
-    ad_idx = fmt.index('AD')
-    if ad_idx >= len(sample):
-        return 0
-    ad_vals = sample[ad_idx].split(',')
-    if len(ad_vals) < 2:
-        return 0
-    try:
-        return int(ad_vals[1])   # ALT depth (index 1)
-    except ValueError:
-        return 0
+
+    def field(name):
+        if name not in fmt:
+            return None
+        idx = fmt.index(name)
+        return sample[idx] if idx < len(sample) else None
+
+    # Option 1: AD field
+    ad_raw = field('AD')
+    if ad_raw and ad_raw not in ('.', ''):
+        ad_vals = ad_raw.split(',')
+        if len(ad_vals) >= 2:
+            try:
+                return int(ad_vals[1])
+            except ValueError:
+                pass
+
+    # Option 2: DP * AF (LongcallR)
+    dp_raw = field('DP')
+    af_raw = field('AF')
+    if dp_raw and af_raw and dp_raw not in ('.', '') and af_raw not in ('.', ''):
+        try:
+            return int(float(dp_raw) * float(af_raw))
+        except ValueError:
+            pass
+
+    return -1   # no depth info — skip depth filter
 
 
 def open_vcf(path):
@@ -166,13 +188,24 @@ def main():
     header_lines = []
     csq_fields = []
 
+    SOMATIC_INFO_HEADERS = (
+        '##INFO=<ID=SOMATIC_CLASS,Number=1,Type=String,'
+        'Description="Somatic classification tier: SOMATIC_KNOWN, NOVEL_CANDIDATE, '
+        'RARE_CANDIDATE, GERMLINE, or UNCERTAIN">\n'
+        '##INFO=<ID=SOMATIC_REASON,Number=1,Type=String,'
+        'Description="Reason for SOMATIC_CLASS assignment">\n'
+    )
+
     with open_vcf(args.input) as fh:
         for line in fh:
             if line.startswith('#'):
                 header_lines.append(line)
                 if not csq_fields:
                     csq_fields = parse_csq_header([line])
-                # Write header to all output files
+                # Insert SOMATIC INFO headers just before the #CHROM line
+                if line.startswith('#CHROM'):
+                    for fout in buckets.values():
+                        fout.write(SOMATIC_INFO_HEADERS)
                 for fout in buckets.values():
                     fout.write(line)
                 continue
