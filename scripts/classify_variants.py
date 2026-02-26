@@ -24,6 +24,7 @@ from pathlib import Path
 GERMLINE_AF    = 0.001    # gnomAD AF >= 0.1%  → exclude as germline
 RARE_AF        = 0.0001   # gnomAD AF < 0.01%  → rare candidate
 MIN_QUAL       = 30       # minimum QUAL for novel candidates
+MIN_ALT_DEPTH  = 5        # minimum ALT supporting reads (FORMAT AD field)
 
 # ClinVar significance terms that indicate pathogenicity
 CLINVAR_PATHOGENIC = {
@@ -94,10 +95,18 @@ def is_somatic_known(csq_entries, fields, existing_var):
     return False, ""
 
 
-def classify_variant(qual, gnomad_af, somatic, somatic_source):
+def classify_variant(qual, gnomad_af, somatic, somatic_source, alt_depth=0):
     """Apply tiered decision logic."""
+    # Low-support calls are unreliable regardless of annotation
+    if alt_depth < MIN_ALT_DEPTH:
+        return "GERMLINE", f"low_depth_AD={alt_depth}"
     if somatic:
-        return "SOMATIC_KNOWN", somatic_source
+        # COSMIC always overrides gnomAD — somatic mutations don't appear in population DBs
+        # ClinVar pathogenic alone defers to gnomAD: ClinVar annotates germline Mendelian
+        # variants (BRCA1, CFTR…) that are common in the population and NOT somatic.
+        is_cosmic = 'COSMIC' in somatic_source
+        if is_cosmic or gnomad_af < GERMLINE_AF:
+            return "SOMATIC_KNOWN", somatic_source
     if gnomad_af >= GERMLINE_AF:
         return "GERMLINE", f"gnomAD_AF={gnomad_af:.4f}"
     if gnomad_af == 0.0 and qual >= MIN_QUAL:
@@ -105,6 +114,26 @@ def classify_variant(qual, gnomad_af, somatic, somatic_source):
     if gnomad_af < RARE_AF:
         return "RARE_CANDIDATE", f"gnomAD_AF={gnomad_af:.6f}"
     return "UNCERTAIN", f"gnomAD_AF={gnomad_af:.4f}"
+
+
+def get_alt_depth(cols):
+    """Parse ALT allele depth from FORMAT AD field. Returns 0 if not present."""
+    if len(cols) < 10:
+        return 0
+    fmt = cols[8].split(':')
+    sample = cols[9].split(':')
+    if 'AD' not in fmt:
+        return 0
+    ad_idx = fmt.index('AD')
+    if ad_idx >= len(sample):
+        return 0
+    ad_vals = sample[ad_idx].split(',')
+    if len(ad_vals) < 2:
+        return 0
+    try:
+        return int(ad_vals[1])   # ALT depth (index 1)
+    except ValueError:
+        return 0
 
 
 def open_vcf(path):
@@ -169,8 +198,9 @@ def main():
             existing_var = vid  # VID column often has rs/COSV IDs
 
             gnomad_af  = get_max_gnomad_af(csq_entries, csq_fields)
+            alt_depth  = get_alt_depth(cols)
             somatic, src = is_somatic_known(csq_entries, csq_fields, existing_var)
-            category, reason = classify_variant(qual, gnomad_af, somatic, src)
+            category, reason = classify_variant(qual, gnomad_af, somatic, src, alt_depth)
 
             # Append classification to INFO
             cols[7] = info + f';SOMATIC_CLASS={category};SOMATIC_REASON={reason}'
@@ -181,6 +211,9 @@ def main():
         fout.close()
 
     # Compress and index each output
+    # Input is already sorted (VEP preserves order), so bgzip directly.
+    # bcftools sort crashes on header-only (empty) VCFs, so we skip it.
+    bgzip   = '/users/pavb5f/.conda/envs/bio-cli/bin/bgzip'
     bcftools = '/users/pavb5f/.conda/envs/bio-cli/bin/bcftools'
     for category, vcf in [
         ('SOMATIC_KNOWN',   'somatic_known.vcf'),
@@ -191,11 +224,13 @@ def main():
     ]:
         vcf_path = out_dir / vcf
         gz_path  = out_dir / (vcf + '.gz')
-        subprocess.run([bcftools, 'sort', str(vcf_path), '-O', 'z', '-o', str(gz_path)],
+        # bgzip in-place (-f overwrite if exists)
+        subprocess.run([bgzip, '-f', str(vcf_path)],
                        check=True, capture_output=True)
-        subprocess.run([bcftools, 'index', '-t', str(gz_path)],
-                       check=True, capture_output=True)
-        vcf_path.unlink()
+        # Only index if file has variants (non-trivial size)
+        if gz_path.stat().st_size > 1024:
+            subprocess.run([bcftools, 'index', '-t', str(gz_path)],
+                           check=True, capture_output=True)
 
     # Summary
     print("\n=== Classification Summary ===")
