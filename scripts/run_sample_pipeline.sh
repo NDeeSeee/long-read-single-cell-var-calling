@@ -71,9 +71,9 @@ GATK="/users/pavb5f/.conda/envs/gatk-env/bin/gatk"
 # Container paths
 DV_SIF="$WORKDIR/containers/deepvariant_1.6.1.sif"
 CLAIR3_SIF="$WORKDIR/containers/clair3_latest.sif"
-LONGCALLR_SIF="$WORKDIR/containers/longcallr_latest.sif"
+LONGCALLR_SIF="$WORKDIR/containers/longcallr_1.12.0.sif"
 VEP_SIF="$WORKDIR/containers/ensembl-vep_release_112.0.sif"
-CLAIR3_MODEL="$WORKDIR/models/clair3_rna"
+CLAIR3_MODEL="/opt/models/hifi"   # bundled inside clair3_latest.sif; same as original run_callers.sh
 VEP_CACHE="$WORKDIR/vep_cache"
 VEP_PLUGINS="$WORKDIR/vep_plugins"
 
@@ -109,21 +109,36 @@ HC_DIR="$RESULTS/haplotypecaller"
 HC_VCF="$HC_DIR/variants_raw.vcf"
 mkdir -p "$HC_DIR"
 
+HC_VCF_NORM="$HC_DIR/variants.vcf.gz"
+
 if [ -f "${HC_VCF}.gz" ] || [ -f "$HC_VCF" ]; then
     skip "$HC_VCF"
 else
-    log "Running GATK HaplotypeCaller (full genome)..."
+    log "Running GATK HaplotypeCaller (canonical chromosomes only)..."
     PATH="/users/pavb5f/.conda/envs/gatk-env/bin:$PATH" \
     "$GATK" HaplotypeCaller \
         -R "$REFERENCE" \
         -I "$BAM_QUAL" \
         -O "$HC_VCF" \
+        -L chr1 -L chr2 -L chr3 -L chr4 -L chr5 \
+        -L chr6 -L chr7 -L chr8 -L chr9 -L chr10 \
+        -L chr11 -L chr12 -L chr13 -L chr14 -L chr15 \
+        -L chr16 -L chr17 -L chr18 -L chr19 -L chr20 \
+        -L chr21 -L chr22 -L chrX -L chrY -L chrM \
         --dont-use-soft-clipped-bases \
         --min-base-quality-score 10 \
         --native-pair-hmm-threads "$THREADS" \
-        --sample-name "$SAMPLE" \
         2>&1 | tee "$LOG_DIR/haplotypecaller.log"
     log "GATK done."
+fi
+
+# Normalize GATK output (matching run_callers.sh behaviour)
+if [ ! -f "$HC_VCF_NORM" ]; then
+    _hc_input="${HC_VCF}.gz"; [ ! -f "$_hc_input" ] && _hc_input="$HC_VCF"
+    log "Normalizing GATK VCF..."
+    "$BCFTOOLS" norm -f "$REFERENCE" -m -any "$_hc_input" | \
+        "$BCFTOOLS" sort -Oz -o "$HC_VCF_NORM"
+    "$BCFTOOLS" index -t "$HC_VCF_NORM"
 fi
 
 # ---------------------------------------------------------------------------
@@ -148,6 +163,7 @@ else
             --reads="$BAM_QUAL" \
             --output_vcf="$DV_VCF" \
             --num_shards="$THREADS" \
+            --regions "chr1 chr2 chr3 chr4 chr5 chr6 chr7 chr8 chr9 chr10 chr11 chr12 chr13 chr14 chr15 chr16 chr17 chr18 chr19 chr20 chr21 chr22 chrX chrY chrM" \
             --intermediate_results_dir="$DV_DIR/tmp" \
         2>&1 | tee "$LOG_DIR/deepvariant.log"
     log "DeepVariant done."
@@ -176,9 +192,10 @@ else
             --platform="hifi" \
             --model_path="$CLAIR3_MODEL" \
             --output="$C3_DIR" \
-            --include_all_ctgs \
-            --no_phasing_for_fa \
-            --haploid_sensitive \
+            --sample_name="$SAMPLE" \
+            --min_mq=5 \
+            --snp_min_af=0.05 \
+            --indel_min_af=0.05 \
         2>&1 | tee "$LOG_DIR/clair3.log"
 
     # Clair3 outputs merge_output.vcf.gz — symlink to standard name
@@ -229,7 +246,7 @@ fi
 log "=== STEP 6: VEP annotation + classification ==="
 
 declare -A CALLER_VCFS=(
-    [gatk]="$HC_DIR/variants_raw.vcf"
+    [gatk]="$HC_VCF_NORM"
     [deepvariant]="$DV_VCF"
     [clair3]="$C3_VCF"
     [longcallr]="$LCR_VCF"
