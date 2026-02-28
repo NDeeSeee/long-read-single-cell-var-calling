@@ -45,6 +45,7 @@ for i in "${!BAM_LIST[@]}"; do
     echo "[$n/$TOTAL] Starting: $sample  ($(date))" | tee -a "$MASTER_LOG"
     echo "----------------------------------------------------------" | tee -a "$MASTER_LOG"
 
+    mkdir -p "$WORKDIR/logs/${sample}"
     if bash "$PIPELINE" "$bam" 2>&1 | tee -a "$WORKDIR/logs/${sample}/pipeline.log"; then
         echo "[$n/$TOTAL] SUCCESS: $sample  ($(date))" | tee -a "$MASTER_LOG"
         PASS=$((PASS + 1))
