@@ -50,23 +50,46 @@ def parse_csq_fields(header_lines):
 
 IMPACT_RANK = {'HIGH': 3, 'MODERATE': 2, 'LOW': 1, 'MODIFIER': 0}
 
+# Within MODIFIER, rank by how close/inside the gene the variant is.
+# non_coding_transcript_exon_variant (inside gene body) > upstream/downstream.
+CONSEQUENCE_SUBRANK = {
+    'non_coding_transcript_exon_variant': 5,
+    'non_coding_transcript_variant':      4,
+    '3_prime_UTR_variant':                3,
+    '5_prime_UTR_variant':                3,
+    'intron_variant':                     2,
+    'upstream_gene_variant':              1,
+    'downstream_gene_variant':            1,
+    'regulatory_region_variant':          1,
+    'intergenic_variant':                 0,
+}
+
+
+def _rank(impact_str, consequence_str):
+    """Return (impact_rank, consequence_subrank) tuple for comparison."""
+    imp = IMPACT_RANK.get(impact_str, 0)
+    # Sub-rank only acts as tiebreaker within the same impact tier
+    sub = CONSEQUENCE_SUBRANK.get(consequence_str.split('&')[0], 0) if imp == 0 else 0
+    return (imp, sub)
+
 
 def extract_gene(csq_string, fields):
     """
     Return Hugo gene symbol from VEP CSQ field.
-    Among canonical transcripts, prefer highest IMPACT (HIGH > MODERATE > LOW > MODIFIER).
-    Falls back to highest-impact non-canonical entry, then first non-empty SYMBOL.
+    Among canonical transcripts, prefer highest IMPACT then consequence specificity.
+    Falls back to highest-rank non-canonical entry, then first non-empty SYMBOL.
     """
     if not fields or not csq_string:
         return '.'
-    sym_idx = fields.index('SYMBOL')    if 'SYMBOL'    in fields else -1
-    can_idx = fields.index('CANONICAL') if 'CANONICAL' in fields else -1
-    imp_idx = fields.index('IMPACT')    if 'IMPACT'    in fields else -1
+    sym_idx  = fields.index('SYMBOL')      if 'SYMBOL'      in fields else -1
+    can_idx  = fields.index('CANONICAL')   if 'CANONICAL'   in fields else -1
+    imp_idx  = fields.index('IMPACT')      if 'IMPACT'      in fields else -1
+    cons_idx = fields.index('Consequence') if 'Consequence' in fields else -1
     if sym_idx == -1:
         return '.'
 
-    best_canonical = ('', -1)   # (symbol, impact_rank)
-    best_any       = ('', -1)
+    best_canonical = ('', (-1, -1))
+    best_any       = ('', (-1, -1))
     first_gene     = ''
 
     for entry in csq_string.split(','):
@@ -78,12 +101,14 @@ def extract_gene(csq_string, fields):
             continue
         if not first_gene:
             first_gene = symbol
-        rank = IMPACT_RANK.get(vals[imp_idx] if imp_idx != -1 and imp_idx < len(vals) else '', 0)
-        if rank > best_any[1]:
-            best_any = (symbol, rank)
+        imp_str  = vals[imp_idx]  if imp_idx  != -1 and imp_idx  < len(vals) else ''
+        cons_str = vals[cons_idx] if cons_idx != -1 and cons_idx < len(vals) else ''
+        r = _rank(imp_str, cons_str)
+        if r > best_any[1]:
+            best_any = (symbol, r)
         is_canonical = can_idx != -1 and can_idx < len(vals) and vals[can_idx] == 'YES'
-        if is_canonical and rank > best_canonical[1]:
-            best_canonical = (symbol, rank)
+        if is_canonical and r > best_canonical[1]:
+            best_canonical = (symbol, r)
 
     if best_canonical[0]:
         return best_canonical[0]

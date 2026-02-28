@@ -235,7 +235,14 @@ else
             --no-bam-output \
         2>&1 | tee "$LOG_DIR/longcallr.log"
 
-    [ -f "$LCR_DIR/variants.vcf" ] && "$BGZIP" "$LCR_DIR/variants.vcf"
+    # LongcallR outputs an unsorted VCF — sort before bgzip+index
+    if [ -f "$LCR_DIR/variants.vcf" ]; then
+        "$BCFTOOLS" sort -Oz -o "$LCR_VCF" "$LCR_DIR/variants.vcf"
+        rm -f "$LCR_DIR/variants.vcf"
+    else
+        # Already bgzipped but possibly unsorted — re-sort in place
+        "$BCFTOOLS" sort -Oz -o "${LCR_VCF}.sorted" "$LCR_VCF" && mv "${LCR_VCF}.sorted" "$LCR_VCF"
+    fi
     "$BCFTOOLS" index -t "$LCR_VCF"
     log "LongcallR done."
 fi

@@ -1,8 +1,9 @@
 # Data Dictionary — RNA-seq Somatic Variant Calling Pipeline
 
-**Sample**: 5801-diagnosis (PacBio Iso-Seq / KINNEX scRNA-seq, Grimes dataset)
+**Cohort**: 8 samples — Grimes MDS/AML KINNEX dataset (PacBio Iso-Seq / KINNEX scRNA-seq)
+**Prototype sample**: 5801-diagnosis (fully annotated, truth-set validated)
 **Reference**: GRCh38 (chr-prefixed, 10x Genomics Space Ranger build)
-**Last updated**: 2026-02-26
+**Last updated**: 2026-02-27
 
 ---
 
@@ -30,8 +31,9 @@
 
 ### Per-Caller Annotated Files
 
-Each caller produces a full VEP-annotated file and five somatic classification buckets:
+Each caller produces a full VEP-annotated file and five somatic classification buckets.
 
+**Prototype sample** (5801-diagnosis):
 ```
 annotation/{gatk,deepvariant,clair3,longcallr}/
 ├── annotated.vcf.gz          — VEP-annotated, all variants
@@ -40,6 +42,24 @@ annotation/{gatk,deepvariant,clair3,longcallr}/
 ├── rare_candidates.vcf.gz    — gnomAD AF < 0.0001
 ├── uncertain.vcf.gz          — gnomAD AF 0.0001–0.001
 └── germline.vcf.gz           — gnomAD AF ≥ 0.001 or AD < 5 (excluded)
+```
+
+**Multi-sample batch** (8 BAMs in `bams/`), run by `scripts/run_sample_pipeline.sh`:
+```
+results/{SAMPLE}/
+├── {SAMPLE}_qual.bam                      — synthetic Q30 preprocessed BAM
+├── haplotypecaller/variants_raw.vcf       — raw GATK calls
+├── haplotypecaller/variants.vcf.gz        — normalized (bcftools norm)
+├── deepvariant/variants.vcf.gz
+├── clair3_rna/variants.vcf.gz
+├── longcallr/variants.vcf.gz
+└── merged/
+    ├── high_confidence_final.{vcf.gz,tsv}
+    ├── medium_confidence_final.{vcf.gz,tsv}
+    └── low_confidence_final.{vcf.gz,tsv}
+
+annotation/{SAMPLE}/{gatk,deepvariant,clair3,longcallr}/
+└── (same bucket structure as prototype above)
 ```
 
 ---
@@ -54,7 +74,7 @@ These columns appear in all `*_final.tsv` files:
 | `POS` | int | 1-based genomic position |
 | `REF` | string | Reference allele |
 | `ALT` | string | Alternate allele (first ALT for multi-allelic sites) |
-| `GENE` | string | Hugo gene symbol from VEP CSQ. Among all VEP transcripts, picks the canonical transcript with highest functional impact (HIGH > MODERATE > LOW > MODIFIER). |
+| `GENE` | string | Hugo gene symbol from VEP CSQ. Among canonical transcripts, picks by highest IMPACT (HIGH > MODERATE > LOW > MODIFIER); within MODIFIER, uses consequence specificity (`non_coding_transcript_exon_variant` > `intron_variant` > `upstream/downstream_gene_variant`). This correctly assigns MT-RNR1, MT-RNR2, and other non-coding RNA genes. |
 | `CONSEQUENCE` | string | Sequence ontology consequence term from highest-impact VEP transcript (e.g. `missense_variant`, `stop_gained`, `frameshift_variant`) |
 | `HGVSp` | string | Protein-level HGVS notation from canonical transcript (e.g. `p.Pro95Arg`) |
 | `HGVSc` | string | cDNA-level HGVS notation from canonical transcript |
@@ -175,12 +195,14 @@ To recover SETBP1/RUNX1/ASXL1: lower the BAM_DP threshold (e.g. >200) or examine
 
 | Script | Input → Output | Description |
 |---|---|---|
-| `scripts/run_callers.sh` | BAM → raw VCFs | Run all 4 callers on `scisoseq_synthetic_qual.bam` |
-| `scripts/annotate_and_filter.sh` | raw VCF → annotated + classified | VEP annotation + classify_variants.py |
+| `scripts/run_all_samples.sh` | `bams/` dir → all outputs | **Batch runner** — loops over all 8 BAMs sequentially, calls run_sample_pipeline.sh per sample |
+| `scripts/run_sample_pipeline.sh` | single BAM → full output | **Single-sample pipeline** — 10 checkpoint-aware steps end-to-end |
+| `scripts/run_callers.sh` | BAM → raw VCFs | Original prototype caller script (5801-diagnosis only) |
 | `scripts/classify_variants.py` | annotated VCF → 5 buckets | Tiered somatic classification |
 | `scripts/merge_callers.py` | 4× classified VCFs → merged tiers | Multi-caller concordance |
-| `scripts/add_bam_annotations.py` | VCF + BAM → VCF with GENE/BAM counts | Adds GENE, BAM_REF, BAM_ALT, BAM_VAF |
+| `scripts/add_bam_annotations.py` | VCF + BAM → VCF with GENE/BAM counts | Adds GENE (consequence-ranked), BAM_REF, BAM_ALT, BAM_VAF |
 | `scripts/vcf_to_table.py` | `*_final.vcf.gz` → TSV | Human-readable flat table |
+| `scripts/add_synthetic_quality.py` | BAM → qual BAM | Adds synthetic Q30 scores (required by GATK for PacBio QUAL=* reads) |
 
 ---
 
@@ -197,3 +219,7 @@ To recover SETBP1/RUNX1/ASXL1: lower the BAM_DP threshold (e.g. >200) or examine
 5. **GATK FORMAT/DP vs BAM_DP**: All depth filtering in this pipeline uses mosdepth `BAM_DP`, not GATK's `FORMAT/DP`. Never filter on `FORMAT/DP` for PacBio data.
 
 6. **LongcallR SNP-only**: LongcallR cannot call indels. ASXL1 frameshift and other indels are not supported by LongcallR's CALLER_COUNT.
+
+7. **Mitochondrial variants not in gnomAD**: chrM variants commonly show gnomAD AF = 0 (gnomAD does not comprehensively index mtDNA haplogroup variants). These appear as NOVEL_CANDIDATE even when they are common haplogroup markers. Treat chrM NOVEL_CANDIDATE calls with caution — high VAF (~1.0) homoplasmic variants are likely germline haplogroup, not somatic.
+
+8. **GATK alt-contig crash**: BAMs aligned with non-standard contig naming (e.g. `chr1_KI270706v1_random`) crash GATK if not restricted to canonical chromosomes. The pipeline restricts GATK and DeepVariant to `chr1–22, chrX, chrY, chrM` via `-L` flags.

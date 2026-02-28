@@ -30,6 +30,25 @@ from pathlib import Path
 IMPACT_RANK = {'HIGH': 3, 'MODERATE': 2, 'LOW': 1, 'MODIFIER': 0}
 COSMIC_RE   = re.compile(r'COSV\d+|COSM\d+')
 
+# Within MODIFIER, rank by how close/inside the gene the variant is.
+CONSEQUENCE_SUBRANK = {
+    'non_coding_transcript_exon_variant': 5,
+    'non_coding_transcript_variant':      4,
+    '3_prime_UTR_variant':                3,
+    '5_prime_UTR_variant':                3,
+    'intron_variant':                     2,
+    'upstream_gene_variant':              1,
+    'downstream_gene_variant':            1,
+    'regulatory_region_variant':          1,
+    'intergenic_variant':                 0,
+}
+
+
+def _csq_rank(impact_str, consequence_str):
+    imp = IMPACT_RANK.get(impact_str, 0)
+    sub = CONSEQUENCE_SUBRANK.get(consequence_str.split('&')[0], 0) if imp == 0 else 0
+    return (imp, sub)
+
 
 def open_vcf(path):
     return gzip.open(str(path), 'rt') if str(path).endswith('.gz') else open(path)
@@ -47,22 +66,25 @@ def parse_csq_header(header_lines):
 def best_csq(csq_string, fields):
     """
     Return the single best CSQ entry as a dict.
-    Prefers canonical + highest IMPACT; falls back to any highest IMPACT.
+    Prefers canonical + highest (IMPACT, consequence_subrank);
+    falls back to any highest-rank entry.
     """
     if not csq_string or not fields:
         return {}
 
-    sym_idx = fields.index('SYMBOL')    if 'SYMBOL'    in fields else -1
-    can_idx = fields.index('CANONICAL') if 'CANONICAL' in fields else -1
-    imp_idx = fields.index('IMPACT')    if 'IMPACT'    in fields else -1
+    can_idx  = fields.index('CANONICAL')   if 'CANONICAL'   in fields else -1
+    imp_idx  = fields.index('IMPACT')      if 'IMPACT'      in fields else -1
+    cons_idx = fields.index('Consequence') if 'Consequence' in fields else -1
 
-    best_canonical = (None, -1)
-    best_any       = (None, -1)
+    best_canonical = (None, (-1, -1))
+    best_any       = (None, (-1, -1))
 
     for entry in csq_string.split(','):
         vals = entry.split('|')
         d    = dict(zip(fields, vals + [''] * max(0, len(fields) - len(vals))))
-        rank = IMPACT_RANK.get(d.get('IMPACT', ''), 0)
+        imp_str  = d.get('IMPACT', '')
+        cons_str = vals[cons_idx] if cons_idx != -1 and cons_idx < len(vals) else ''
+        rank = _csq_rank(imp_str, cons_str)
         is_can = can_idx != -1 and can_idx < len(vals) and vals[can_idx] == 'YES'
         if rank > best_any[1]:
             best_any = (d, rank)
