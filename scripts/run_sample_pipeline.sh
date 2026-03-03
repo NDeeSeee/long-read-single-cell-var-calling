@@ -299,6 +299,7 @@ for caller in gatk deepvariant clair3 longcallr; do
             --symbol \
             --hgvs \
             --offline \
+            --force_overwrite \
         2>&1 | tee "$CALLER_ANNOT_DIR/vep.log"
 
     "$BCFTOOLS" sort "$CALLER_ANNOT_DIR/annotated.vcf" \
