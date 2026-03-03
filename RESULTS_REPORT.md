@@ -21,7 +21,7 @@ This pipeline performs somatic variant calling on PacBio Iso-Seq (KINNEX) long-r
 | 4 | MDS5801-preVEN_342__2 | ✅ Complete |
 | 5 | MDS5801-preVEN_342__3 | 🔄 In progress — VEP annotation (Step 6) |
 | 6 | MDS5801R-341 | 🔄 In progress — Synthetic quality preprocessing (Step 1) |
-| 7 | WM71-0121-5801_CD34 | ⏳ Queued |
+| 7 | WM71-0121-5801_CD34 | ✅ Complete (prototype run) |
 | 8 | XTX14_2_MDS_5801_CD34 | ⏳ Queued |
 
 ---
@@ -190,6 +190,28 @@ annotation/{SAMPLE}/gatk/
 
 ---
 
+### 4.5 WM71-0121-5801_CD34
+
+> **Note:** Processed as the prototype sample using `scisoseq.mapped.bam` (same BAM, different filename). GATK non-germline count is low because the prototype GATK run was restricted to truth-set regions only, not canonical chromosomes. Merged caller results reflect the full BAM run.
+
+| Output | Variants |
+|--------|----------|
+| Germline (GATK) | 1,351,237 |
+| Non-germline GATK (BAM_DP > 1500) | 72 (truth-region restricted) |
+| High-confidence merged (≥3 callers) | **983** |
+| Medium-confidence merged (2 callers) | 289 |
+| Low-confidence merged (1 caller) | 609 |
+
+**High-confidence somatic classification:**
+- SOMATIC_KNOWN: 927 (94.3%)
+- NOVEL_CANDIDATE: 33 (3.4%)
+- RARE_CANDIDATE: 14 (1.4%)
+- UNCERTAIN: 9 (0.9%)
+
+**Caller support (high-confidence):** 639 variants by 3 callers; 344 by all 4 callers
+
+---
+
 ## 5. Samples In Progress
 
 ### MDS5801-preVEN_342__3 (Sample 5)
@@ -208,10 +230,9 @@ Started from Step 1 (synthetic quality preprocessing) on 2026-03-03 13:12. Runni
 
 | Sample | Status |
 |--------|--------|
-| WM71-0121-5801_CD34 | Queued (sample 7) |
 | XTX14_2_MDS_5801_CD34 | Queued (sample 8) |
 
-These will be processed sequentially by `run_all_samples.sh` after samples 5 and 6 complete.
+XTX14_2_MDS_5801_CD34 will be started automatically by `run_all_samples.sh` once Sample 6 (MDS5801R-341) callers complete. WM71-0121-5801_CD34 outputs (symlinked from prototype run) are already detected as complete by the batch runner and will be skipped.
 
 ---
 
