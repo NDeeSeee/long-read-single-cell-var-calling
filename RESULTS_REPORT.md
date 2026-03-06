@@ -19,10 +19,10 @@ This pipeline performs somatic variant calling on PacBio Iso-Seq (KINNEX) long-r
 | 2 | MDS5801-postHMA_CD34 | ✅ Complete |
 | 3 | MDS5801-preVEN_342__1 | ✅ Complete |
 | 4 | MDS5801-preVEN_342__2 | ✅ Complete |
-| 5 | MDS5801-preVEN_342__3 | 🔄 In progress — VEP annotation (Step 6) |
-| 6 | MDS5801R-341 | 🔄 In progress — Synthetic quality preprocessing (Step 1) |
+| 5 | MDS5801-preVEN_342__3 | ✅ Complete |
+| 6 | MDS5801R-341 | ✅ Complete |
 | 7 | WM71-0121-5801_CD34 | ✅ Complete (prototype run) |
-| 8 | XTX14_2_MDS_5801_CD34 | ⏳ Queued |
+| 8 | XTX14_2_MDS_5801_CD34 | ✅ Complete |
 
 ---
 
@@ -211,28 +211,77 @@ annotation/{SAMPLE}/gatk/
 **Caller support (high-confidence):** 639 variants by 3 callers; 344 by all 4 callers
 
 ---
+### 4.6 MDS5801-preVEN_342__3
 
-## 5. Samples In Progress
+| Output | Variants |
+|--------|----------|
+| Germline (GATK) | 1,276,528 |
+| Non-germline GATK (BAM_DP > 1500) | 1,613 |
+| High-confidence merged (≥3 callers) | **1,109** |
+| Medium-confidence merged (2 callers) | 388 |
+| Low-confidence merged (1 caller) | 995 |
 
-### MDS5801-preVEN_342__3 (Sample 5)
+**High-confidence somatic classification:**
+- SOMATIC_KNOWN: 1,017 (91.7%)
+- NOVEL_CANDIDATE: 50 (4.5%)
+- RARE_CANDIDATE: 22 (2.0%)
+- UNCERTAIN: 20 (1.8%)
 
-All 4 caller VCFs are complete (Steps 1–5 done). Currently in **Step 6 (VEP annotation)** — annotating the Clair3 VCF (largest caller output, ~40M compressed). GATK and DeepVariant annotation already complete. Expected to finish within ~3–4 hours.
-
-**Note:** This sample's VEP run was interrupted on 2026-03-01 (server process killed after ~45 min). The incomplete output was cleaned up and VEP was restarted with `--force_overwrite` (now default in the pipeline).
-
-### MDS5801R-341 (Sample 6)
-
-Started from Step 1 (synthetic quality preprocessing) on 2026-03-03 13:12. Running sequentially after sample 5 completes in the batch runner. Estimated total runtime: 20–24 hours.
+**Caller support (high-confidence):** 739 variants by 3 callers; 370 by all 4 callers
 
 ---
 
-## 6. Queued Samples
+### 4.7 MDS5801R-341
 
-| Sample | Status |
-|--------|--------|
-| XTX14_2_MDS_5801_CD34 | Queued (sample 8) |
+| Output | Variants |
+|--------|----------|
+| Germline (GATK) | 1,066,424 |
+| Non-germline GATK (BAM_DP > 1500) | 1,376 |
+| High-confidence merged (≥3 callers) | **985** |
+| Medium-confidence merged (2 callers) | 307 |
+| Low-confidence merged (1 caller) | 698 |
 
-XTX14_2_MDS_5801_CD34 will be started automatically by `run_all_samples.sh` once Sample 6 (MDS5801R-341) callers complete. WM71-0121-5801_CD34 outputs (symlinked from prototype run) are already detected as complete by the batch runner and will be skipped.
+**High-confidence somatic classification:**
+- SOMATIC_KNOWN: 930 (94.4%)
+- NOVEL_CANDIDATE: 28 (2.8%)
+- RARE_CANDIDATE: 15 (1.5%)
+- UNCERTAIN: 12 (1.2%)
+
+**Caller support (high-confidence):** 663 variants by 3 callers; 322 by all 4 callers
+
+---
+
+### 4.8 XTX14_2_MDS_5801_CD34
+
+| Output | Variants |
+|--------|----------|
+| Germline (GATK) | 1,314,163 |
+| Non-germline GATK (BAM_DP > 1500) | 3,875 |
+| High-confidence merged (≥3 callers) | **1,484** |
+| Medium-confidence merged (2 callers) | 1,132 |
+| Low-confidence merged (1 caller) | 6,390 |
+
+**High-confidence somatic classification:**
+- SOMATIC_KNOWN: 1,327 (89.4%)
+- NOVEL_CANDIDATE: 110 (7.4%)
+- RARE_CANDIDATE: 27 (1.8%)
+- UNCERTAIN: 20 (1.3%)
+
+**Caller support (high-confidence):** 1,016 variants by 3 callers; 468 by all 4 callers
+
+> **Note:** XTX14 has a notably higher NOVEL_CANDIDATE rate (7.4% vs 3–5% cohort average) and a larger low-confidence tier, suggesting a distinct mutational landscape. The elevated non-germline GATK count (3,875) relative to other samples is also notable and warrants further review — RNA editing (REDIportal) filtering is a priority for this sample.
+
+---
+
+## 5. All Samples Complete
+
+All 8 samples completed successfully as of 2026-03-05 01:18. Pipeline ran via `run_all_samples.sh` with pipeline-stage parallelism. Total wall-clock time from first sample start to last sample finish: ~7 days (including multiple crash recoveries and restarts).
+
+---
+
+## 6. ~~Queued Samples~~
+
+All samples complete — this section is no longer applicable.
 
 ---
 
